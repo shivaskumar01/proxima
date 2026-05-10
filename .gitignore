@@ -1,0 +1,12 @@
+build/
+.venv/
+__pycache__/
+*.pyc
+*.so
+*.dylib
+.cache/
+.DS_Store
+data/
+*.fvecs
+*.ivecs
+benchmarks/results_*.json

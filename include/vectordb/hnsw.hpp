@@ -1,0 +1,111 @@
+#pragma once
+
+#include "vectordb/types.hpp"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <random>
+#include <string>
+#include <vector>
+
+namespace vectordb {
+
+// Per-thread visited tracker. The generation counter lets us "reset" the
+// whole buffer in O(1) by bumping the counter; only when it wraps do we
+// memset (~once per 4B searches per thread, never in practice).
+struct VisitedSet {
+    std::vector<uint32_t> marks;
+    uint32_t gen = 0;
+
+    void resize_to(std::size_t n) {
+        if (marks.size() < n) marks.resize(n, 0);
+    }
+    uint32_t bump() {
+        if (gen == std::numeric_limits<uint32_t>::max()) {
+            std::fill(marks.begin(), marks.end(), 0);
+            gen = 0;
+        }
+        return ++gen;
+    }
+};
+
+// HNSW (Hierarchical Navigable Small World) index following Malkov & Yashunin
+// 2016 (arXiv:1603.09320). Single-threaded build/search; correctness-first.
+//
+// Tunables:
+//   M               base connectivity per layer above 0 (typ. 8..32)
+//   M_max0          max connectivity at layer 0 (default 2*M)
+//   ef_construction beam width during insertion (typ. 100..400)
+//   ef              beam width during search (typ. k..256)
+class HnswIndex {
+public:
+    HnswIndex(std::size_t dim, Metric metric,
+              std::size_t M = 16,
+              std::size_t ef_construction = 200,
+              uint64_t seed = 42);
+
+    void add(const float* data, std::size_t n);
+
+    void search(const float* queries, std::size_t nq, std::size_t k,
+                std::size_t ef,
+                float* out_distances, label_t* out_labels) const;
+
+    std::size_t size() const noexcept { return ntotal_; }
+    std::size_t dim()  const noexcept { return dim_; }
+
+    // Diagnostic: histogram of node levels (size = max_level+1).
+    std::vector<std::size_t> level_histogram() const;
+
+    // Persistence. Format: magic "VHN1", u32 version, hyperparams,
+    // ntotal/level/data, then per-node nested neighbor lists.
+    void save(const std::string& path) const;
+    static HnswIndex load(const std::string& path);
+
+private:
+    using DistFn = float (*)(const float*, const float*, std::size_t);
+    using PairF  = std::pair<float, id_t>;   // (distance, node id)
+
+    int    random_level();
+    float  distance(const float* a, const float* b) const noexcept;
+    const float* vec(id_t id) const noexcept { return data_.data() + id * dim_; }
+
+    // Search a single layer; returns up to ef closest nodes (unsorted vector
+    // representing a max-heap snapshot, caller may sort).
+    // Visited state is provided by the caller so multiple threads can share
+    // a const HnswIndex.
+    std::vector<PairF> search_layer(const float* q, id_t entry,
+                                    std::size_t ef, int layer,
+                                    VisitedSet& vs) const;
+
+    // Heuristic neighbor selection (Algorithm 4 in the paper).
+    // candidates is a list of (distance, id) pairs to consider; M is target.
+    std::vector<PairF> select_neighbors_heuristic(
+        const float* q,
+        const std::vector<PairF>& candidates,
+        std::size_t M) const;
+
+    void connect(id_t new_id, const std::vector<PairF>& neighbors, int layer);
+
+    std::size_t dim_;
+    Metric      metric_;
+    std::size_t M_;
+    std::size_t M_max_;
+    std::size_t M_max0_;
+    std::size_t ef_construction_;
+    double      level_mult_;       // 1 / ln(M)
+    DistFn      dist_fn_;
+
+    std::size_t ntotal_ = 0;
+    std::vector<float> data_;             // ntotal * dim, row-major
+    std::vector<int>   level_;            // per-node max layer
+    std::vector<std::vector<std::vector<id_t>>> links_;  // [id][layer] -> neighbor ids
+
+    int    max_level_   = -1;
+    id_t   entry_point_ = 0;
+
+    mutable std::mt19937_64 rng_;
+};
+
+}  // namespace vectordb
