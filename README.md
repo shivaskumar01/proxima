@@ -20,7 +20,7 @@ Silicon, scalar fallback elsewhere.
 ```bash
 cd ~/vectordb
 python3 -m venv .venv
-.venv/bin/pip install numpy faiss-cpu pybind11 pytest
+.venv/bin/pip install numpy faiss-cpu pybind11 pytest matplotlib
 cmake -S . -B build -DPython3_EXECUTABLE=$(pwd)/.venv/bin/python
 cmake --build build -j
 .venv/bin/python -m pytest tests/ -v
@@ -72,9 +72,9 @@ loaded = HnswIndex.load("hnsw.bin")
 ![SIFT1M recall vs QPS](benchmarks/results_sift1m.png)
 
 **Honest read of the chart:**
-- **HNSW (blue):** ours sits 19-27% behind FAISS across the recall axis (QPS ratio 0.73-0.81 from `results_sift1m.json`); same curve shape, just shifted right. The remaining gap is the bulk-distance kernel.
+- **HNSW (blue):** ours sits 19-27% behind FAISS across the recall axis (QPS ratio 0.73-0.81 from the SIFT1M benchmark run); same curve shape, just shifted right. The remaining gap is the bulk-distance kernel.
 - **IVF-PQ at low nprobe:** **ours beats FAISS** at nprobe=1 for both M=8 (416k vs 382k qps, +9%) and M=16 (349k vs 299k qps, +17%) — the vectorized LUT build pays off most when LUT cost dominates list-scan cost.
-- **IVF-PQ at high nprobe:** ours is now within ~2× of FAISS (was 2-3×) after vectorizing the LUT build. The remaining gap is the inverted-list code-scan loop, where FAISS's `IndexPQFastScan` does 16 lookups per `tbl` instruction; ours sums them scalar. That's the v3 work below.
+- **IVF-PQ at high nprobe:** ours is now within ~2× of FAISS on SIFT1M (was 2-3×) after vectorizing the LUT build. The remaining gap is the inverted-list code-scan loop — FAISS's `IndexIVFPQ` uses a SIMD-accelerated PQ scan path that we don't yet match. That's the v3 work below.
 
 
 HNSW (M=16, efConstruction=200):
@@ -109,7 +109,7 @@ IVF-PQ (nlist=1000):
 quantization are correct end-to-end on a real dataset.
 
 **HNSW QPS sits 19-27% behind FAISS** across the efSearch sweep (ratios
-0.73-0.81 from `results_sift1m.json`). The gap narrows at higher recall —
+0.73-0.81 from the SIFT1M benchmark run). The gap narrows at higher recall —
 at efS=256 we're at 81% of FAISS QPS. The remaining gap is SIMD distance
 kernels (FAISS uses bulk batched-distance routines that vectorize across
 many candidates at once).
@@ -171,7 +171,8 @@ GIST. The remaining GIST gap is the inverted-list code scan, same as on
 SIFT — that's the v3 SIMD PQ scan work.
 
 The recall ceiling at ~0.16 (M=16, full scan) is what 240× compression buys
-on 960-dim Gaussians: PQ throws away too much to recover much beyond that.
+on 960-dim GIST descriptors: PQ throws away too much to recover much
+beyond that.
 This is the dataset, not a bug — FAISS plateaus at the same place.
 
 > **Bug found while benching GIST1M**: my IVF-PQ `encode_vector` had a
@@ -303,19 +304,24 @@ coexist with FAISS in the same Python process for honest side-by-side
 benchmarks.
 
 This single change closed the HNSW QPS gap from ~8× to ~1.2-1.4× (19-27%
-behind), and the IVF-PQ gap from 8-20× to ~1-2× (depending on nprobe).
+behind). The IVF-PQ gap closed from 8-20× to roughly 1-2× on SIFT1M and
+~2-4× on GIST1M (the high-dim, high-nprobe regime where the SIMD code-scan
+matters most).
 
 ### Remaining gap vs FAISS
 
 After parallelism + vectorized LUT build, the residual gap is now entirely
 in two specific places:
 
-- **SIMD PQ code scan** (FAISS's `IndexPQFastScan`): the inverted-list scan
-  loop. FAISS reorganizes codes for 4-bit quantization so 16 PQ entries can
-  be looked up via a single NEON `tbl` instruction; ours sums M scalar
-  lookups per code. Visible as the gap that *opens* as `nprobe` grows in
-  the IVF-PQ table — at nprobe=1 we beat FAISS, at nprobe=32 we're ~1.7×
-  behind. This is the only remaining IVF-PQ optimization that matters.
+- **SIMD PQ code scan**: the inverted-list scan loop. FAISS's `IndexIVFPQ`
+  (what we benchmark against) uses a SIMD-accelerated PQ scan path that we
+  don't yet match; ours sums M scalar lookups per code. Visible as the gap
+  that *opens* as `nprobe` grows in the IVF-PQ table — at nprobe=1 we beat
+  FAISS, at nprobe=32 we're ~1.7× behind on SIFT1M (~3-4× on GIST1M). The
+  natural reference design for closing this is the `tbl`-instruction trick
+  used in FAISS's separate `IndexPQFastScan` class (4-bit codes, 16-byte
+  LUT, one `tbl` per 16 lookups) — that's a different index type and a
+  weekend of work to bring over.
 - **Bulk distance kernels** (`fvec_L2sqr_ny`): one query against many
   candidates in a vectorized pass. Visible as the modest residual HNSW gap
   at high efSearch where each query touches thousands of candidates.
@@ -333,6 +339,18 @@ vectordb/
 ├── tests/              # pytest correctness tests vs Flat
 └── benchmarks/         # SIFT1M loader + side-by-side FAISS bench
 ```
+
+## Clean state for distribution
+
+`.gitignore` excludes `build/`, `data/`, `.venv/`, compiled `*.so`,
+`__pycache__/`, and `benchmarks/results_*.json` — so a `git clone` is
+clean. If you instead `zip` the local working tree, those artifacts will
+be included. To wipe them:
+
+```bash
+git clean -fdX     # remove every gitignored file (safe; ignores tracked)
+```
+
 
 ## References
 

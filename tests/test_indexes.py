@@ -397,6 +397,30 @@ def test_ivfpq_list_sizes_before_train():
     assert sizes == [0] * 8
 
 
+def test_ivfpq_retrain_resets_ntotal():
+    """train() invalidates previously encoded vectors, so it must reset
+    ntotal_ too. Otherwise new add() calls start labels at the stale offset
+    and the inverted lists end up with phantom holes."""
+    d = 16
+    train_data = gen_data(400, d)            # >= KSUB
+    add_data   = gen_data(20, d)
+    idx = IvfPqIndex(dim=d, nlist=4, M=4)
+    idx.train(train_data)
+    idx.add(add_data)
+    assert idx.size == 20
+
+    # Re-training should fully reset.
+    idx.train(train_data)
+    assert idx.size == 0
+    assert sum(idx.list_sizes()) == 0
+
+    # New labels start at 0, not 20.
+    idx.add(add_data)
+    assert idx.size == 20
+    _, L = idx.search(add_data, k=1, nprobe=4)
+    assert L.min() >= 0 and L.max() < 20
+
+
 def test_ivfpq_train_too_few_for_pq_codebooks():
     """KSUB=256 codes per subspace require n >= 256 training points; otherwise
     kmeans clamps internally and the codebook memcpy reads past the end."""
@@ -416,7 +440,10 @@ def test_ivfpq_train_too_few_for_pq_codebooks():
     lambda: IvfPqIndex(dim=16, nlist=4, M=0),
 ])
 def test_constructors_reject_bad_params(ctor):
-    with pytest.raises((ValueError, ZeroDivisionError)):
+    # Strict ValueError-only: previously also accepted ZeroDivisionError
+    # to paper over HNSW M<=1 (which divided by log(M)=0). The constructors
+    # now validate explicitly; M=0/M=1 must be a clean ValueError.
+    with pytest.raises(ValueError):
         ctor()
 
 

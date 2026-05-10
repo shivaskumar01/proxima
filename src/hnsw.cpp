@@ -51,7 +51,7 @@ HnswIndex::search_layer(const float* q, id_t entry,
                         std::size_t ef, int layer,
                         VisitedSet& vs) const {
     // Generation-counter visited tracking, owned by the caller so search() can
-    // run with one VisitedSet per OpenMP thread (no shared mutable state).
+    // run with one VisitedSet per std::thread worker (no shared mutable state).
     vs.resize_to(ntotal_);
     const uint32_t mark = vs.bump();
     auto& visited = vs.marks;

@@ -87,8 +87,13 @@ void IvfPqIndex::train(const float* data, std::size_t n) {
                         ctx.cb.data(), KSUB * dsub_ * sizeof(float));
         });
 
+    // Full state reset: re-training invalidates any previously encoded codes
+    // (they reference the old PQ codebooks). Wiping inv_labels_/inv_codes_ but
+    // not ntotal_ would silently drift label assignments — new add() calls
+    // would start labels at the stale offset, leaving holes the user can't see.
     inv_labels_.assign(nlist_, {});
     inv_codes_.assign(nlist_, {});
+    ntotal_ = 0;
     rebuild_codebooks_T();
     trained_ = true;
 }
