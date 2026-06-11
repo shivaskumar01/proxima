@@ -1,4 +1,5 @@
 #include "vectordb/ivfpq.hpp"
+#include "vectordb/coarse.hpp"
 #include "vectordb/distance.hpp"
 #include "vectordb/io.hpp"
 #include "vectordb/kmeans.hpp"
@@ -212,12 +213,33 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
     // queries. ADC lookup table is M * KSUB floats — for M=8 that's 8KB,
     // fits in L1d.
     struct SearchCtx {
-        std::vector<float>   coarse_d;
+        std::vector<float>   coarse_d;   // per-query path only
         std::vector<int32_t> coarse_idx;
         std::vector<float>   qdot;   // -2 * <q_m, r_mk>, built once per query
         std::vector<float>   lut;
     };
-    parallel_for<SearchCtx>(nq,
+
+    // Phase 1 of each slab: the coarse scan for a block of queries at once,
+    // 4 queries x 4 centroids register-tiled (see coarse.hpp — at high dim
+    // this scan is bandwidth-bound and dominates low-nprobe searches).
+    // The phase-split batched scan trades an extra coarse-matrix round-trip
+    // and a phase barrier for 4x less centroid traffic. Measured: +20-44%
+    // at GIST (960-dim, 3.8 MB of centroid reads per query) and a 5-15%
+    // LOSS at SIFT (128-dim, 0.5 MB) where the round-trip dominates the
+    // saving. Gate on per-query coarse traffic.
+    const bool batched_coarse =
+        nlist_ * dim_ * sizeof(float) >= (std::size_t{1} << 20);
+    std::vector<float> coarse_all(
+        batched_coarse ? std::min(nq, kCoarseSlab) * nlist_ : 0);
+
+    for (std::size_t s0 = 0; s0 < nq; s0 += kCoarseSlab) {
+        const std::size_t sn = std::min(kCoarseSlab, nq - s0);
+        if (batched_coarse) {
+            coarse_scan_block(coarse_all.data(), queries + s0 * dim_, sn,
+                              coarse_centroids_.data(), nlist_, dim_);
+        }
+
+    parallel_for<SearchCtx>(sn,
         [nlist = nlist_, M = M_]() {
             SearchCtx c;
             c.coarse_d.resize(nlist);
@@ -226,16 +248,23 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
             c.lut.resize(M * KSUB);
             return c;
         },
-        [&](std::size_t qi, SearchCtx& ctx) {
-            auto& coarse_d   = ctx.coarse_d;
+        [&](std::size_t si, SearchCtx& ctx) {
+            const std::size_t qi = s0 + si;
             auto& coarse_idx = ctx.coarse_idx;
             auto& qdot       = ctx.qdot;
             auto& lut        = ctx.lut;
         const float* q = queries + qi * dim_;
 
-        // 1. Distance from q to every coarse centroid; take top nprobe.
-        //    Centroid rows are contiguous -> batched 4-row kernel.
-        l2sq_ny(coarse_d.data(), q, coarse_centroids_.data(), nlist_, dim_);
+        // 1. Coarse distances: this query's row of the slab matrix when
+        //    batched, else computed inline (the 128-dim regime).
+        const float* coarse_d;
+        if (batched_coarse) {
+            coarse_d = coarse_all.data() + si * nlist_;
+        } else {
+            l2sq_ny(ctx.coarse_d.data(), q, coarse_centroids_.data(),
+                    nlist_, dim_);
+            coarse_d = ctx.coarse_d.data();
+        }
         for (std::size_t c = 0; c < nlist_; ++c) {
             coarse_idx[c] = static_cast<int32_t>(c);
         }
@@ -393,6 +422,7 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
             out_labels[qi * k + j]    = -1;
         }
     });
+    }  // slab loop
 }
 
 // ---- persistence ---------------------------------------------------------

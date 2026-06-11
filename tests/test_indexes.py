@@ -634,6 +634,29 @@ def test_ivfpqfs_k_zero_and_pre_train():
     assert D.shape == (5, 0) and L.shape == (5, 0)
 
 
+def test_ivfpq_batched_coarse_path():
+    """nlist*dim*4 >= 1 MB triggers the slab-batched 4x4-tiled coarse scan
+    (the high-dim path used by GIST). Regression: a missing gate once sent
+    the non-batched path through a zero-length slab buffer -> segfault; the
+    batched branch itself was never covered by tests until this one."""
+    d, nlist, M, n = 1024, 256, 8, 1500   # 256*1024*4 = 1 MiB exactly
+    data = gen_data(n, d)
+    queries = gen_data(20, d)
+
+    idx = IvfPqIndex(dim=d, nlist=nlist, M=M, kmeans_iters=5, seed=2)
+    idx.train(data)
+    idx.add(data)
+    D, L = idx.search(queries, k=5, nprobe=8)
+    assert (L >= -1).all() and (L < n).all()
+    assert (D[L >= 0] > -1e-2).all()
+
+    fs = IvfPqFastScan(dim=d, nlist=nlist, M=M, kmeans_iters=5, seed=2)
+    fs.train(data)
+    fs.add(data)
+    D, L = fs.search(queries, k=5, nprobe=8)
+    assert (L >= -1).all() and (L < n).all()
+
+
 def test_ivfpq_adc_distances_sane():
     """Guards the precomputed-table ADC expansion:
     ||(q-c)-r||^2 = ||q-c||^2 + (||r||^2 + 2<c,r>) - 2<q,r>.

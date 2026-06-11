@@ -238,6 +238,51 @@ void dot_x4(const float* q,
 
 #endif
 
+#if VECTORDB_HAS_NEON
+
+void l2sq_4x4(const float* q, std::size_t q_stride,
+              const float* c, std::size_t c_stride,
+              std::size_t d, float* out) noexcept {
+    float32x4_t acc[4][4];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) acc[i][j] = vdupq_n_f32(0.0f);
+
+    std::size_t t = 0;
+    for (; t + 4 <= d; t += 4) {
+        float32x4_t qv[4], cv[4];
+        for (int i = 0; i < 4; ++i) qv[i] = vld1q_f32(q + i * q_stride + t);
+        for (int j = 0; j < 4; ++j) cv[j] = vld1q_f32(c + j * c_stride + t);
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                float32x4_t df = vsubq_f32(qv[i], cv[j]);
+                acc[i][j] = vfmaq_f32(acc[i][j], df, df);
+            }
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            float sum = vaddvq_f32(acc[i][j]);
+            for (std::size_t r = t; r < d; ++r) {
+                float df = q[i * q_stride + r] - c[j * c_stride + r];
+                sum += df * df;
+            }
+            out[i * 4 + j] = sum;
+        }
+    }
+}
+
+#else
+
+void l2sq_4x4(const float* q, std::size_t q_stride,
+              const float* c, std::size_t c_stride,
+              std::size_t d, float* out) noexcept {
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
+            out[i * 4 + j] = l2sq(q + i * q_stride, c + j * c_stride, d);
+}
+
+#endif
+
 void l2sq_ny(float* out, const float* q, const float* base,
              std::size_t ny, std::size_t d) noexcept {
     std::size_t i = 0;

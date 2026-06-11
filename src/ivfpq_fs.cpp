@@ -1,4 +1,5 @@
 #include "vectordb/ivfpq_fs.hpp"
+#include "vectordb/coarse.hpp"
 #include "vectordb/distance.hpp"
 #include "vectordb/io.hpp"
 #include "vectordb/kmeans.hpp"
@@ -196,14 +197,33 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
     if (nprobe > nlist_) nprobe = nlist_;
 
     struct SearchCtx {
-        std::vector<float>   coarse_d;
+        std::vector<float>   coarse_d;   // per-query path only
         std::vector<int32_t> coarse_idx;
         std::vector<float>   qdot;    // -2<q_m, r_mk>, M*16
         std::vector<float>   lut_f;   // exact float LUT for current probe
         std::vector<uint8_t> lut8;    // quantized LUT (underestimates)
         std::vector<float>   bmin;    // per-subspace quantization bias
     };
-    parallel_for<SearchCtx>(nq,
+
+    // Slab-batched coarse scan, 4 queries x 4 centroids register-tiled.
+    // The phase-split batched scan trades an extra coarse-matrix round-trip
+    // and a phase barrier for 4x less centroid traffic. Measured: +20-44%
+    // at GIST (960-dim, 3.8 MB of centroid reads per query) and a 5-15%
+    // LOSS at SIFT (128-dim, 0.5 MB) where the round-trip dominates the
+    // saving. Gate on per-query coarse traffic.
+    const bool batched_coarse =
+        nlist_ * dim_ * sizeof(float) >= (std::size_t{1} << 20);
+    std::vector<float> coarse_all(
+        batched_coarse ? std::min(nq, kCoarseSlab) * nlist_ : 0);
+
+    for (std::size_t s0 = 0; s0 < nq; s0 += kCoarseSlab) {
+    const std::size_t sn = std::min(kCoarseSlab, nq - s0);
+    if (batched_coarse) {
+        coarse_scan_block(coarse_all.data(), queries + s0 * dim_, sn,
+                          coarse_centroids_.data(), nlist_, dim_);
+    }
+
+    parallel_for<SearchCtx>(sn,
         [nlist = nlist_, M = M_]() {
             SearchCtx c;
             c.coarse_d.resize(nlist);
@@ -214,13 +234,21 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
             c.bmin.resize(M);
             return c;
         },
-        [&](std::size_t qi, SearchCtx& ctx) {
+        [&](std::size_t si, SearchCtx& ctx) {
+        const std::size_t qi = s0 + si;
         const float* q = queries + qi * dim_;
-        auto& coarse_d   = ctx.coarse_d;
         auto& coarse_idx = ctx.coarse_idx;
 
-        // 1. Coarse scan + top-nprobe selection.
-        l2sq_ny(coarse_d.data(), q, coarse_centroids_.data(), nlist_, dim_);
+        // 1. Coarse distances: this query's row of the slab matrix when
+        //    batched, else computed inline (the 128-dim regime).
+        const float* coarse_d;
+        if (batched_coarse) {
+            coarse_d = coarse_all.data() + si * nlist_;
+        } else {
+            l2sq_ny(ctx.coarse_d.data(), q, coarse_centroids_.data(),
+                    nlist_, dim_);
+            coarse_d = ctx.coarse_d.data();
+        }
         for (std::size_t c = 0; c < nlist_; ++c) {
             coarse_idx[c] = static_cast<int32_t>(c);
         }
@@ -347,6 +375,7 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
 #if defined(__ARM_NEON)
                 // 5. The fast scan: per subspace pair, one load + two tbl
                 //    lookups score 16 candidates; u16 lanes accumulate.
+                __builtin_prefetch(bp + bb, 0, 0);   // next block's codes
                 uint16x8_t acc_lo = vdupq_n_u16(0);
                 uint16x8_t acc_hi = vdupq_n_u16(0);
                 const uint8x16_t nib_mask = vdupq_n_u8(0x0F);
@@ -363,11 +392,21 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
                     acc_lo = vaddw_u8(acc_lo, vget_low_u8(t1));
                     acc_hi = vaddw_u8(acc_hi, vget_high_u8(t1));
                 }
-                uint16_t vals[BLOCK];
-                vst1q_u16(vals, acc_lo);
-                vst1q_u16(vals + 8, acc_hi);
-                for (std::size_t i = 0; i < lanes; ++i) {
-                    if (vals[i] > thr) continue;       // safe prune
+
+                // 6. SIMD survivor mask: compare all 16 lanes against the
+                //    quantized threshold at once. The common steady state —
+                //    a tight top-k and no survivors in the block — is one
+                //    compare + one reduction + one branch, with no per-lane
+                //    work at all. Survivor lanes (rare) are walked via the
+                //    narrowed bitmask instead of a 16-iteration loop.
+                const uint16x8_t thr_v =
+                    vdupq_n_u16(thr > 0xFFFFu ? 0xFFFFu
+                                              : static_cast<uint16_t>(thr));
+                const uint16x8_t le_lo = vcleq_u16(acc_lo, thr_v);
+                const uint16x8_t le_hi = vcleq_u16(acc_hi, thr_v);
+                if (vmaxvq_u16(vorrq_u16(le_lo, le_hi)) == 0) continue;
+
+                auto rescore_lane = [&](std::size_t i) {
                     float dist = exact_rescore(bp, i);
                     if (top.size() < k) {
                         top.push({dist, labels_c[b * BLOCK + i]});
@@ -376,6 +415,36 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
                         top.pop();
                         top.push({dist, labels_c[b * BLOCK + i]});
                         thr = qthresh();
+                    }
+                };
+
+                if (lanes == BLOCK) {
+                    // vshrn narrows each 0xFFFF/0x0000 lane to a 0xFF/0x00
+                    // byte; reinterpret as u64 and walk set bytes.
+                    uint64_t m_lo = vget_lane_u64(
+                        vreinterpret_u64_u8(vshrn_n_u16(le_lo, 4)), 0);
+                    uint64_t m_hi = vget_lane_u64(
+                        vreinterpret_u64_u8(vshrn_n_u16(le_hi, 4)), 0);
+                    while (m_lo) {
+                        std::size_t i = static_cast<std::size_t>(
+                            __builtin_ctzll(m_lo)) >> 3;
+                        m_lo &= ~(0xFFull << (i * 8));
+                        rescore_lane(i);
+                    }
+                    while (m_hi) {
+                        std::size_t i = static_cast<std::size_t>(
+                            __builtin_ctzll(m_hi)) >> 3;
+                        m_hi &= ~(0xFFull << (i * 8));
+                        rescore_lane(8 + i);
+                    }
+                } else {
+                    // Partial tail block (at most one per list): dead lanes
+                    // hold zero-codes, so bound the walk by the live count.
+                    uint16_t vals[BLOCK];
+                    vst1q_u16(vals, acc_lo);
+                    vst1q_u16(vals + 8, acc_hi);
+                    for (std::size_t i = 0; i < lanes; ++i) {
+                        if (vals[i] <= thr) rescore_lane(i);
                     }
                 }
 #else
@@ -406,6 +475,7 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
             out_labels[qi * k + j]    = -1;
         }
     });
+    }  // slab loop
 }
 
 // ---- persistence ---------------------------------------------------------
