@@ -41,6 +41,11 @@ public:
     // Add vectors after training. Each vector is encoded into M bytes.
     void add(const float* data, std::size_t n);
 
+    // Physically remove vectors by label. Surviving labels are unchanged
+    // and never reused (labels come from a monotonic counter, not the live
+    // count). Returns the number removed.
+    std::size_t remove_ids(const label_t* labels, std::size_t n);
+
     // Search top-k. nprobe controls the recall/QPS knob: lists scanned per query.
     void search(const float* queries, std::size_t nq, std::size_t k,
                 std::size_t nprobe,
@@ -80,7 +85,8 @@ private:
     Metric      metric_;
 
     bool        trained_ = false;
-    std::size_t ntotal_  = 0;
+    std::size_t ntotal_  = 0;          // LIVE count
+    label_t     next_label_ = 0;       // monotonic; derived from max on load
 
     // Coarse: nlist * dim, row-major.
     std::vector<float> coarse_centroids_;

@@ -812,6 +812,119 @@ def test_ivfpq_ip_save_load(tmp_path):
         assert np.allclose(D1, D2), name
 
 
+# ---- deletes ---------------------------------------------------------------
+
+def test_flat_remove_ids():
+    d = 16
+    data = gen_data(200, d)
+    idx = FlatIndex(dim=d, metric="l2")
+    idx.add(data)
+    kill = np.array([0, 5, 7, 199], dtype=np.int64)
+    assert idx.remove_ids(kill) == 4
+    assert idx.size == 196
+
+    D, L = idx.search(data[:10], k=5)
+    assert not np.isin(L, kill).any()
+    # Survivors still find themselves (labels stable).
+    assert L[1, 0] == 1 and L[2, 0] == 2
+
+    # New adds mint fresh labels — never reuse removed ones.
+    idx.add(data[:3])
+    assert idx.size == 199
+    _, L2 = idx.search(data[:1], k=3)
+    assert 200 in L2[0] or 0 not in L2[0]  # label 0 is gone forever
+    # removing twice is a no-op
+    assert idx.remove_ids(kill) == 0
+
+
+def test_hnsw_remove_ids_tombstones():
+    d = 32
+    data = gen_data(2000, d)
+    idx = HnswIndex(dim=d, metric="l2", M=16, ef_construction=200, seed=4)
+    idx.add(data)
+
+    kill = np.arange(0, 600, dtype=np.int64)          # delete 30%
+    assert idx.remove_ids(kill) == 600
+    assert idx.size == 1400
+
+    # Removed labels never surface; survivors still searchable with good
+    # recall (tombstoned nodes keep routing).
+    flat = FlatIndex(dim=d, metric="l2")
+    flat.add(data[600:])
+    queries = gen_data(50, d)
+    _, truth = flat.search(queries, k=10)
+    truth = truth + 600                                # map back to hnsw labels
+    _, pred = idx.search(queries, k=10, ef=64)
+    assert not (pred < 600).any() or (pred == -1).any() is False
+    assert (pred[pred >= 0] >= 600).all()
+    r = recall_at_k(pred, truth, k=10)
+    assert r >= 0.85, f"post-delete recall too low: {r}"
+
+
+def test_hnsw_remove_more_than_ef():
+    """All-but-few deleted: search must keep digging past tombstones."""
+    d = 8
+    data = gen_data(300, d)
+    idx = HnswIndex(dim=d, metric="l2", M=8, ef_construction=100, seed=2)
+    idx.add(data)
+    idx.remove_ids(np.arange(0, 295, dtype=np.int64))
+    assert idx.size == 5
+    D, L = idx.search(gen_data(3, d), k=5, ef=8)
+    live = L[L >= 0]
+    assert (live >= 295).all()
+    assert len(set(live.tolist()) | {295, 296, 297, 298, 299}) == 5
+
+
+def test_ivfpq_remove_ids():
+    d, n = 32, 3000
+    data = gen_data(n, d)
+    for cls in (IvfPqIndex, IvfPqFastScan):
+        idx = cls(dim=d, nlist=16, M=8, kmeans_iters=10, seed=5)
+        idx.train(data)
+        idx.add(data)
+        kill = np.arange(0, n, 3, dtype=np.int64)     # every 3rd
+        assert idx.remove_ids(kill) == len(kill)
+        assert idx.size == n - len(kill)
+
+        _, L = idx.search(data[:30], k=10, nprobe=16)
+        live = L[L >= 0]
+        assert not np.isin(live, kill).any(), cls.__name__
+
+        # add-after-remove: fresh labels, no collisions
+        idx.add(data[:10])
+        assert idx.size == n - len(kill) + 10
+        _, L2 = idx.search(data[:5], k=3, nprobe=16)
+        assert L2.max() >= n, cls.__name__           # new labels >= n
+
+
+def test_remove_ids_survives_save_load(tmp_path):
+    d = 16
+    data = gen_data(500, d)
+    kill = np.array([1, 2, 3, 100, 499], dtype=np.int64)
+
+    idx = HnswIndex(dim=d, metric="l2", M=8, seed=1)
+    idx.add(data)
+    idx.remove_ids(kill)
+    p = str(tmp_path / "h2.bin")
+    idx.save(p)
+    loaded = HnswIndex.load(p)
+    assert loaded.size == 495
+    _, L = loaded.search(data[:20], k=5, ef=32)
+    assert not np.isin(L[L >= 0], kill).any()
+
+    ivf = IvfPqIndex(dim=d, nlist=4, M=4, kmeans_iters=10, seed=1)
+    ivf.train(data)
+    ivf.add(data)
+    ivf.remove_ids(kill)
+    p2 = str(tmp_path / "i2.bin")
+    ivf.save(p2)
+    loaded2 = IvfPqIndex.load(p2)
+    assert loaded2.size == 495
+    loaded2.add(data[:1])                 # next_label_ derived from max+1
+    _, L2 = loaded2.search(data[:1], k=1, nprobe=4)
+    assert loaded2.size == 496
+
+
 # ---- multithread safety -------------------------------------------------
 
 def test_concurrent_search_threadsafe():

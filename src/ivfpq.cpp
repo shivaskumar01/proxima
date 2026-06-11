@@ -9,6 +9,7 @@
 #include <cstring>
 #include <queue>
 #include <stdexcept>
+#include <unordered_set>
 
 #include "vectordb/simd.hpp"
 
@@ -104,6 +105,7 @@ void IvfPqIndex::train(const float* data, std::size_t n) {
     inv_labels_.assign(nlist_, {});
     inv_codes_.assign(nlist_, {});
     ntotal_ = 0;
+    next_label_ = 0;
     rebuild_codebooks_T();
     if (metric_ == Metric::L2) {
         rebuild_precomputed_table();   // IP has no per-probe centroid term
@@ -200,13 +202,35 @@ void IvfPqIndex::add(const float* data, std::size_t n) {
     // Phase 2 (serial): append to the inverted lists in input order so labels
     // remain sequential and list contents deterministic.
     for (std::size_t i = 0; i < n; ++i) {
-        label_t lbl = static_cast<label_t>(ntotal_ + i);
-        inv_labels_[coarse[i]].push_back(lbl);
+        inv_labels_[coarse[i]].push_back(next_label_++);
         auto& dst = inv_codes_[coarse[i]];
         dst.insert(dst.end(), codes.begin() + i * M_,
                    codes.begin() + (i + 1) * M_);
     }
     ntotal_ += n;
+}
+
+std::size_t IvfPqIndex::remove_ids(const label_t* labels, std::size_t n) {
+    std::unordered_set<label_t> kill(labels, labels + n);
+    std::size_t removed = 0;
+    for (std::size_t c = 0; c < nlist_; ++c) {
+        auto& ls = inv_labels_[c];
+        auto& cs = inv_codes_[c];
+        std::size_t w = 0;
+        for (std::size_t r = 0; r < ls.size(); ++r) {
+            if (kill.count(ls[r])) { ++removed; continue; }
+            if (w != r) {
+                ls[w] = ls[r];
+                std::copy(cs.begin() + r * M_, cs.begin() + (r + 1) * M_,
+                          cs.begin() + w * M_);
+            }
+            ++w;
+        }
+        ls.resize(w);
+        cs.resize(w * M_);
+    }
+    ntotal_ -= removed;
+    return removed;
 }
 
 namespace {
@@ -540,6 +564,12 @@ IvfPqIndex IvfPqIndex::load(const std::string& path) {
                 r.read_raw(idx.inv_codes_[i].data(),  n_i * M);
             }
         }
+        // Labels are monotonic but holes may exist after removals; the next
+        // fresh label is one past the maximum ever assigned.
+        label_t mx = -1;
+        for (const auto& ls : idx.inv_labels_)
+            for (label_t l : ls) mx = std::max(mx, l);
+        idx.next_label_ = mx + 1;
     }
     return idx;
 }

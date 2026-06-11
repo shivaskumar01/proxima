@@ -46,6 +46,10 @@ public:
                 std::size_t nprobe,
                 float* out_distances, label_t* out_labels) const;
 
+    // Physically remove vectors by label (lists are filtered and repacked).
+    // Surviving labels unchanged; labels never reused. Returns count removed.
+    std::size_t remove_ids(const label_t* labels, std::size_t n);
+
     bool        is_trained() const noexcept { return trained_; }
     std::size_t size() const noexcept { return ntotal_; }
     std::size_t dim()  const noexcept { return dim_; }
@@ -81,7 +85,8 @@ private:
     Metric      metric_;
 
     bool        trained_ = false;
-    std::size_t ntotal_  = 0;
+    std::size_t ntotal_  = 0;          // LIVE count
+    label_t     next_label_ = 0;       // monotonic; derived from max on load
 
     std::vector<float> coarse_centroids_;     // nlist * dim
     std::vector<float> pq_codebooks_;         // M * KSUB * dsub

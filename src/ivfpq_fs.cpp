@@ -9,6 +9,7 @@
 #include <cstring>
 #include <queue>
 #include <stdexcept>
+#include <unordered_set>
 
 #include "vectordb/simd.hpp"
 
@@ -91,6 +92,7 @@ void IvfPqFastScan::train(const float* data, std::size_t n) {
     inv_labels_.assign(nlist_, {});
     inv_packed_.assign(nlist_, {});
     ntotal_ = 0;
+    next_label_ = 0;
     rebuild_codebooks_T();
     if (metric_ == Metric::L2) {
         rebuild_precomputed_table();
@@ -189,9 +191,52 @@ void IvfPqFastScan::add(const float* data, std::size_t n) {
             packed[base + p * BLOCK + lane] =
                 static_cast<uint8_t>(code[2 * p] | (code[2 * p + 1] << 4));
         }
-        labels.push_back(static_cast<label_t>(ntotal_ + i));
+        labels.push_back(next_label_++);
     }
     ntotal_ += n;
+}
+
+std::size_t IvfPqFastScan::remove_ids(const label_t* labels, std::size_t n) {
+    std::unordered_set<label_t> kill(labels, labels + n);
+    const std::size_t bb = block_bytes();
+    std::size_t removed = 0;
+    for (std::size_t c = 0; c < nlist_; ++c) {
+        auto& ls = inv_labels_[c];
+        if (ls.empty()) continue;
+        auto& packed = inv_packed_[c];
+
+        // Unpack survivors' codes, then rebuild the block layout. Removal
+        // is rare relative to scans, and lists are small; correctness over
+        // cleverness.
+        std::vector<label_t> keep_l;
+        std::vector<uint8_t> keep_c;            // M_ bytes per survivor
+        keep_l.reserve(ls.size());
+        keep_c.reserve(ls.size() * M_);
+        for (std::size_t r = 0; r < ls.size(); ++r) {
+            if (kill.count(ls[r])) { ++removed; continue; }
+            keep_l.push_back(ls[r]);
+            const uint8_t* bp = packed.data() + (r / BLOCK) * bb;
+            const std::size_t lane = r % BLOCK;
+            for (std::size_t p = 0; p < M_ / 2; ++p) {
+                const uint8_t byte = bp[p * BLOCK + lane];
+                keep_c.push_back(byte & 0x0F);
+                keep_c.push_back(byte >> 4);
+            }
+        }
+        ls = std::move(keep_l);
+        packed.assign(((ls.size() + BLOCK - 1) / BLOCK) * bb, 0);
+        for (std::size_t i = 0; i < ls.size(); ++i) {
+            const std::size_t base = (i / BLOCK) * bb;
+            const std::size_t lane = i % BLOCK;
+            const uint8_t* code = keep_c.data() + i * M_;
+            for (std::size_t p = 0; p < M_ / 2; ++p) {
+                packed[base + p * BLOCK + lane] =
+                    static_cast<uint8_t>(code[2 * p] | (code[2 * p + 1] << 4));
+            }
+        }
+    }
+    ntotal_ -= removed;
+    return removed;
 }
 
 namespace {
@@ -389,6 +434,8 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
                 }
                 return dist;
             };
+#if VECTORDB_USE_NEON
+            // The scalar build scans exactly and never consults thresholds.
             auto qthresh = [&]() -> uint32_t {
                 if (top.size() < k) return 0xFFFFFFFFu;
                 float t = (top.top().distance - qbase) * inv_delta;
@@ -396,9 +443,7 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
                 if (t >= 65535.0f) return 0xFFFFFFFFu;
                 return static_cast<uint32_t>(t);
             };
-
-#if VECTORDB_USE_NEON
-            uint32_t thr = qthresh();   // scalar path scans exactly, no filter
+            uint32_t thr = qthresh();
 #endif
             const std::size_t bb = block_bytes();
             const std::size_t nblocks = (n_c + BLOCK - 1) / BLOCK;
@@ -594,6 +639,10 @@ IvfPqFastScan IvfPqFastScan::load(const std::string& path) {
                 r.read_raw(idx.inv_packed_[i].data(), idx.inv_packed_[i].size());
             }
         }
+        label_t mx = -1;
+        for (const auto& ls : idx.inv_labels_)
+            for (label_t l : ls) mx = std::max(mx, l);
+        idx.next_label_ = mx + 1;
     }
     return idx;
 }

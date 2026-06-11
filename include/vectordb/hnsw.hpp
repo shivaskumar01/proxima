@@ -72,7 +72,13 @@ public:
                 std::size_t ef,
                 float* out_distances, label_t* out_labels) const;
 
-    std::size_t size() const noexcept { return ntotal_; }
+    // Tombstone deletion (hnswlib-style mark_deleted): nodes stay in the
+    // graph as routing waypoints — removing edges would shred connectivity —
+    // but never appear in results. Memory is not reclaimed; labels (= node
+    // ids) stay stable. Returns the number newly marked.
+    std::size_t remove_ids(const label_t* labels, std::size_t n);
+
+    std::size_t size() const noexcept { return nlive_; }   // live nodes
     std::size_t dim()  const noexcept { return dim_; }
 
     // Diagnostic: histogram of node levels (size = max_level+1).
@@ -120,10 +126,13 @@ private:
 
     // Beam search within one layer; returns up to ef closest nodes
     // (unsorted max-heap snapshot, caller may sort).
+    // `deleted` (may be null) filters nodes out of the RESULT set while
+    // still traversing them.
     template <bool kLocked>
     std::vector<PairF> search_layer(const float* q, id_t entry,
                                     std::size_t ef, int layer,
-                                    SearchCtx& ctx, std::mutex* locks) const;
+                                    SearchCtx& ctx, std::mutex* locks,
+                                    const uint8_t* deleted = nullptr) const;
 
     // Heuristic neighbor selection (Algorithm 4 in the paper).
     // candidates is a list of (distance, id) pairs to consider; M is target.
@@ -151,7 +160,9 @@ private:
     double      level_mult_;       // 1 / ln(M)
     DistFn      dist_fn_;
 
-    std::size_t ntotal_ = 0;
+    std::size_t ntotal_ = 0;              // storage slots (incl. tombstones)
+    std::size_t nlive_  = 0;              // ntotal_ minus tombstones
+    std::vector<uint8_t> deleted_;        // per-node tombstone marks
     std::vector<float> data_;             // ntotal * dim, row-major
     std::vector<int>   level_;            // per-node max layer
     std::vector<std::vector<std::vector<id_t>>> links_;  // [id][layer] -> neighbor ids

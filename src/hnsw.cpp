@@ -127,7 +127,8 @@ template <bool kLocked>
 std::vector<HnswIndex::PairF>
 HnswIndex::search_layer(const float* q, id_t entry,
                         std::size_t ef, int layer,
-                        SearchCtx& ctx, std::mutex* locks) const {
+                        SearchCtx& ctx, std::mutex* locks,
+                        const uint8_t* deleted) const {
     // Generation-counter visited tracking, owned by the caller so search()
     // can run with one SearchCtx per std::thread worker (no shared state).
     VisitedSet& vs = ctx.visited;
@@ -140,21 +141,27 @@ HnswIndex::search_layer(const float* q, id_t entry,
 
     float d0 = distance(q, vec(entry));
     candidates.emplace(d0, entry);
-    top.emplace(d0, entry);
+    if (!deleted || !deleted[entry]) top.emplace(d0, entry);
     visited[entry] = mark;
 
+    // Tombstoned nodes are traversed (they remain routing waypoints) but
+    // never enter `top`, so they cannot occupy result slots. With deletions
+    // `top` may briefly be empty; the termination bound only applies once
+    // ef live results exist.
     auto consider = [&](id_t e, float ed) {
         if (top.size() < ef || ed < top.top().first) {
             candidates.emplace(ed, e);
-            top.emplace(ed, e);
-            if (top.size() > ef) top.pop();
+            if (!deleted || !deleted[e]) {
+                top.emplace(ed, e);
+                if (top.size() > ef) top.pop();
+            }
         }
     };
 
     float d4[4];
     while (!candidates.empty()) {
         PairF cur = candidates.top();
-        if (cur.first > top.top().first) break;
+        if (top.size() >= ef && cur.first > top.top().first) break;
         candidates.pop();
 
         const std::vector<id_t>* nb;
@@ -348,6 +355,8 @@ void HnswIndex::add(const float* data_in, std::size_t n) {
         links_[start + k].resize(lv + 1);
     }
     ntotal_ = start + n;
+    nlive_ += n;
+    deleted_.resize(ntotal_, 0);
 
     std::size_t first = 0;
     if (start == 0) {
@@ -383,11 +392,25 @@ void HnswIndex::add(const float* data_in, std::size_t n) {
         });
 }
 
+std::size_t HnswIndex::remove_ids(const label_t* labels, std::size_t n) {
+    std::size_t removed = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const label_t l = labels[i];
+        if (l < 0 || static_cast<std::size_t>(l) >= ntotal_) continue;
+        if (!deleted_[static_cast<std::size_t>(l)]) {
+            deleted_[static_cast<std::size_t>(l)] = 1;
+            --nlive_;
+            ++removed;
+        }
+    }
+    return removed;
+}
+
 void HnswIndex::search(const float* queries, std::size_t nq, std::size_t k,
                        std::size_t ef,
                        float* out_distances, label_t* out_labels) const {
     if (k == 0) return;  // (nq, 0) output; no per-query work needed.
-    if (ntotal_ == 0) {
+    if (nlive_ == 0) {
         for (std::size_t i = 0; i < nq * k; ++i) {
             out_distances[i] = -1.0f;
             out_labels[i]    = -1;
@@ -409,7 +432,9 @@ void HnswIndex::search(const float* queries, std::size_t nq, std::size_t k,
             id_t curr = greedy_descend<false>(q, entry_point_, max_level_, 0,
                                               ctx, nullptr);
 
-            auto W = search_layer<false>(q, curr, ef, 0, ctx, nullptr);
+            auto W = search_layer<false>(q, curr, ef, 0, ctx, nullptr,
+                                         nlive_ == ntotal_ ? nullptr
+                                                           : deleted_.data());
             std::sort(W.begin(), W.end(),
                       [](const PairF& a, const PairF& b) { return a.first < b.first; });
 
@@ -431,7 +456,7 @@ void HnswIndex::search(const float* queries, std::size_t nq, std::size_t k,
 void HnswIndex::save(const std::string& path) const {
     io::Writer w(path);
     w.write_magic("VHN1");
-    w.write_pod<uint32_t>(1);
+    w.write_pod<uint32_t>(2);                  // v2 adds the tombstone bitmap
     w.write_pod<uint64_t>(dim_);
     w.write_pod<uint8_t>(metric_ == Metric::L2 ? 0 : 1);
     w.write_pod<uint64_t>(M_);
@@ -446,6 +471,7 @@ void HnswIndex::save(const std::string& path) const {
     if (ntotal_ > 0) {
         w.write_raw(level_.data(), ntotal_ * sizeof(int));
         w.write_raw(data_.data(),  ntotal_ * dim_ * sizeof(float));
+        w.write_raw(deleted_.data(), ntotal_ * sizeof(uint8_t));
     }
 
     // Per-node, per-layer neighbor lists. Variable-width by design.
@@ -466,7 +492,9 @@ HnswIndex HnswIndex::load(const std::string& path) {
     io::Reader r(path);
     r.check_magic("VHN1");
     uint32_t version = r.read_pod<uint32_t>();
-    if (version != 1) throw std::runtime_error("HnswIndex: unsupported file version");
+    if (version != 1 && version != 2) {
+        throw std::runtime_error("HnswIndex: unsupported file version");
+    }
 
     uint64_t dim             = r.read_pod<uint64_t>();
     uint8_t  mb              = r.read_pod<uint8_t>();
@@ -494,10 +522,16 @@ HnswIndex HnswIndex::load(const std::string& path) {
 
     idx.level_.resize(ntotal);
     idx.data_.resize(static_cast<std::size_t>(ntotal) * dim);
+    idx.deleted_.assign(ntotal, 0);
     if (ntotal > 0) {
         r.read_raw(idx.level_.data(), ntotal * sizeof(int));
         r.read_raw(idx.data_.data(),  ntotal * dim * sizeof(float));
+        if (version >= 2) {
+            r.read_raw(idx.deleted_.data(), ntotal * sizeof(uint8_t));
+        }
     }
+    idx.nlive_ = idx.ntotal_;
+    for (uint8_t dflag : idx.deleted_) idx.nlive_ -= dflag;
 
     idx.links_.assign(ntotal, {});
     for (std::size_t id = 0; id < ntotal; ++id) {

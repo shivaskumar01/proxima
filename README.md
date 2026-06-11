@@ -19,6 +19,17 @@ elsewhere. Construction is multi-threaded end-to-end: HNSW inserts in
 parallel with hnswlib-style per-node locking, IVF-PQ parallelizes k-means
 assignment, PQ codebook training, and encoding.
 
+**Deletes:** every index supports `remove_ids(labels)`. Labels are stable
+across removals and never reused (assignment runs off a monotonic counter,
+not the live count — the classic add-after-remove collision). Flat and the
+IVF-PQ family compact physically; HNSW uses hnswlib-style tombstones —
+deleted nodes keep routing traffic (cutting edges would shred graph
+connectivity) but cannot enter the result set, and `search_layer`'s
+termination bound only engages once `ef` *live* results exist, so search
+digs past arbitrarily many tombstones. Post-delete recall on survivors
+measures ≥0.85 after deleting 30% of a graph. File formats bump (Flat v2:
+explicit labels; HNSW v2: tombstone bitmap); v1 files still load.
+
 **Metrics:** every index supports `metric="l2"` and `metric="ip"` (inner
 product; cosine = normalize your vectors and queries first). IP IVF-PQ
 follows FAISS's raw-vector-encoding design but measures *better* than
@@ -70,6 +81,10 @@ xn = xb / np.linalg.norm(xb, axis=1, keepdims=True)
 ip = IvfPqIndex(dim=128, nlist=1024, M=8, metric="ip")
 ip.train(xn[:50_000]); ip.add(xn)
 
+# Deletes: labels are stable and never reused. HNSW marks tombstones
+# (nodes keep routing, memory not reclaimed); the others compact physically.
+removed = ivf.remove_ids(np.array([3, 17, 42], dtype=np.int64))
+
 # Persistence — round-trip preserves search results bit-for-bit.
 idx.save("hnsw.bin")
 loaded = HnswIndex.load("hnsw.bin")
@@ -85,6 +100,11 @@ loaded = HnswIndex.load("hnsw.bin")
 .venv/bin/python benchmarks/gist_loader.py --download   # ~2.6 GB, harder dataset
 .venv/bin/python benchmarks/plot_results.py --dataset gist1m
 ```
+
+CI builds and tests three flavors on every push: `macos-14` (NEON),
+`macos-14` with `-DVECTORDB_FORCE_SCALAR=ON`, and x86 `ubuntu` (scalar) —
+the scalar fallbacks had never been compiled before the matrix existed,
+which is exactly how fallback bit-rot happens.
 
 `plot_results.py` re-execs itself once per series so each sweep runs in its
 own process: load → build one index → measure → merge into the JSON → exit.

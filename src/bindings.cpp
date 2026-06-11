@@ -31,6 +31,20 @@ const float* check_2d_dim(const FloatArr& arr, std::size_t dim,
     return static_cast<const float*>(buf.ptr);
 }
 
+using LabelArr = py::array_t<label_t, py::array::c_style | py::array::forcecast>;
+
+template <typename Idx>
+std::size_t py_remove_ids(Idx& self, LabelArr ids) {
+    auto buf = ids.request();
+    if (buf.ndim != 1) {
+        throw std::invalid_argument("ids must be a 1-D array of int64 labels");
+    }
+    const auto* p = static_cast<const label_t*>(buf.ptr);
+    const auto  n = static_cast<std::size_t>(buf.shape[0]);
+    py::gil_scoped_release release;
+    return self.remove_ids(p, n);
+}
+
 template <typename Idx>
 auto py_search(const Idx& self, FloatArr queries, std::size_t k) {
     std::size_t nq;
@@ -69,6 +83,8 @@ PYBIND11_MODULE(_vectordb, m) {
              py::arg("data"))
         .def("search", &py_search<FlatIndex>,
              py::arg("queries"), py::arg("k"))
+        .def("remove_ids", &py_remove_ids<FlatIndex>, py::arg("ids"),
+             "Remove vectors by label; surviving labels are unchanged and never reused. HNSW marks tombstones (memory not reclaimed); the others compact physically. Returns the number removed.")
         .def("reserve", &FlatIndex::reserve, py::arg("n"),
              "Pre-size storage for n total vectors (avoids 2x realloc peaks "
              "when streaming chunked add() calls).")
@@ -114,6 +130,8 @@ PYBIND11_MODULE(_vectordb, m) {
                  return std::make_pair(dists, labels);
              },
              py::arg("queries"), py::arg("k"), py::arg("ef") = 64)
+        .def("remove_ids", &py_remove_ids<HnswIndex>, py::arg("ids"),
+             "Remove vectors by label; surviving labels are unchanged and never reused. HNSW marks tombstones (memory not reclaimed); the others compact physically. Returns the number removed.")
         .def("reserve", &HnswIndex::reserve, py::arg("n"),
              "Pre-size storage for n total vectors (avoids 2x realloc peaks "
              "when streaming chunked add() calls).")
@@ -167,6 +185,8 @@ PYBIND11_MODULE(_vectordb, m) {
              },
              py::arg("queries"), py::arg("k"), py::arg("nprobe") = 8)
         .def("save", &IvfPqIndex::save, py::arg("path"))
+        .def("remove_ids", &py_remove_ids<IvfPqIndex>, py::arg("ids"),
+             "Remove vectors by label; surviving labels are unchanged and never reused. HNSW marks tombstones (memory not reclaimed); the others compact physically. Returns the number removed.")
         .def_static("load", &IvfPqIndex::load, py::arg("path"))
         .def_property_readonly("is_trained", &IvfPqIndex::is_trained)
         .def_property_readonly("size",  &IvfPqIndex::size)
@@ -219,6 +239,8 @@ PYBIND11_MODULE(_vectordb, m) {
              },
              py::arg("queries"), py::arg("k"), py::arg("nprobe") = 8)
         .def("save", &IvfPqFastScan::save, py::arg("path"))
+        .def("remove_ids", &py_remove_ids<IvfPqFastScan>, py::arg("ids"),
+             "Remove vectors by label; surviving labels are unchanged and never reused. HNSW marks tombstones (memory not reclaimed); the others compact physically. Returns the number removed.")
         .def_static("load", &IvfPqFastScan::load, py::arg("path"))
         .def_property_readonly("is_trained", &IvfPqFastScan::is_trained)
         .def_property_readonly("size",  &IvfPqFastScan::size)
