@@ -11,7 +11,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import numpy as np
 import pytest
 
-from vectordb import FlatIndex, HnswIndex, IvfPqIndex
+from vectordb import FlatIndex, HnswIndex, IvfPqIndex, IvfPqFastScan
 
 
 RNG = np.random.default_rng(0)
@@ -526,6 +526,138 @@ def test_ivfpq_add_after_load_continues_labels(tmp_path):
     # New vectors should mostly resolve to the new label range [30, 50).
     assert L.max() < 50
     assert (L >= 30).sum() >= 15
+
+
+# ---- IvfPqFastScan (4-bit tbl scan) ---------------------------------------
+
+def test_ivfpqfs_recall_vs_flat():
+    """4-bit fast-scan at 2x the subspaces should be in the same recall
+    ballpark as 8-bit PQ at the same byte budget."""
+    d, n = 32, 5000
+    data = gen_data(n, d)
+    queries = gen_data(50, d)
+
+    flat = FlatIndex(dim=d, metric="l2")
+    flat.add(data)
+    _, truth = flat.search(queries, k=10)
+
+    fs = IvfPqFastScan(dim=d, nlist=32, M=16, kmeans_iters=15, seed=7)  # 8 B codes
+    fs.train(data)
+    fs.add(data)
+    assert fs.is_trained and fs.size == n
+    _, pred = fs.search(queries, k=10, nprobe=32)
+    r_fs = recall_at_k(pred, truth, k=10)
+
+    pq = IvfPqIndex(dim=d, nlist=32, M=8, kmeans_iters=15, seed=7)      # 8 B codes
+    pq.train(data)
+    pq.add(data)
+    _, pred8 = pq.search(queries, k=10, nprobe=32)
+    r_pq = recall_at_k(pred8, truth, k=10)
+
+    assert r_fs >= 0.30, f"fast-scan recall too low: {r_fs}"
+    # Same byte budget: 16x4-bit should not be far below 8x8-bit.
+    assert r_fs >= r_pq - 0.10, f"fs {r_fs:.3f} vs pq8 {r_pq:.3f}"
+
+
+def test_ivfpqfs_quantized_filter_is_lossless():
+    """The u8-quantized SIMD pass only PRUNES (underestimates compared
+    against the current top-k); survivors are re-scored with the exact float
+    LUT. Results must therefore match brute-force ADC over all probes:
+    verify against a k=n exhaustive search of the same index."""
+    d, n = 16, 700
+    data = gen_data(n, d)
+    queries = gen_data(20, d)
+    fs = IvfPqFastScan(dim=d, nlist=4, M=8, kmeans_iters=10, seed=3)
+    fs.train(data)
+    fs.add(data)
+
+    # Exhaustive: k = n with all lists probed → every candidate scored.
+    D_all, L_all = fs.search(queries, k=n, nprobe=4)
+    # Filtered: normal top-10. Must equal the top-10 of the exhaustive run.
+    D10, L10 = fs.search(queries, k=10, nprobe=4)
+    assert np.allclose(D10, D_all[:, :10], atol=1e-4)
+    assert np.array_equal(L10, L_all[:, :10])
+
+
+def test_ivfpqfs_partial_block_lanes():
+    """List sizes not divisible by 16 leave dead lanes in the last block;
+    they must never surface as results."""
+    d, n = 16, 23           # single list, 1 full block + 7 live lanes
+    data = gen_data(200, d)
+    fs = IvfPqFastScan(dim=d, nlist=1, M=4, kmeans_iters=10, seed=1)
+    fs.train(data)
+    fs.add(data[:n])
+    D, L = fs.search(gen_data(5, d), k=n, nprobe=1)
+    assert L.shape == (5, n)
+    assert (L >= 0).all() and (L < n).all()
+    assert len(set(L[0].tolist())) == n      # all distinct, no phantom lanes
+
+
+def test_ivfpqfs_save_load(tmp_path):
+    d = 32
+    data = gen_data(3000, d)
+    queries = gen_data(40, d)
+    fs = IvfPqFastScan(dim=d, nlist=16, M=8, kmeans_iters=10, seed=5)
+    fs.train(data)
+    fs.add(data)
+    D1, L1 = fs.search(queries, k=10, nprobe=8)
+
+    p = str(tmp_path / "fs.bin")
+    fs.save(p)
+    loaded = IvfPqFastScan.load(p)
+    assert loaded.is_trained and loaded.size == fs.size and loaded.M == fs.M
+    D2, L2 = loaded.search(queries, k=10, nprobe=8)
+    assert np.array_equal(L1, L2)
+    assert np.allclose(D1, D2)
+
+
+def test_ivfpqfs_rejects_bad_params():
+    with pytest.raises(ValueError):
+        IvfPqFastScan(dim=33, nlist=4, M=8)    # 33 % 8 != 0
+    with pytest.raises(ValueError):
+        IvfPqFastScan(dim=30, nlist=4, M=5)    # M odd
+    with pytest.raises(ValueError):
+        IvfPqFastScan(dim=0, nlist=4, M=2)
+    idx = IvfPqFastScan(dim=16, nlist=8, M=4)
+    with pytest.raises(ValueError):
+        idx.train(gen_data(4, 16))             # < nlist
+
+
+def test_ivfpqfs_k_zero_and_pre_train():
+    idx = IvfPqFastScan(dim=16, nlist=4, M=4)
+    assert idx.list_sizes() == [0] * 4
+    with pytest.raises(RuntimeError):
+        idx.search(gen_data(2, 16), k=3, nprobe=2)   # search before train
+    idx.train(gen_data(300, 16))
+    idx.add(gen_data(50, 16))
+    D, L = idx.search(gen_data(5, 16), k=0, nprobe=2)
+    assert D.shape == (5, 0) and L.shape == (5, 0)
+
+
+def test_ivfpq_adc_distances_sane():
+    """Guards the precomputed-table ADC expansion:
+    ||(q-c)-r||^2 = ||q-c||^2 + (||r||^2 + 2<c,r>) - 2<q,r>.
+    A sign error in any term shows up as negative distances or distances
+    wildly off from the true (uncompressed) ones."""
+    d, M, nlist, n = 32, 8, 16, 3000
+    data = gen_data(n, d)
+    queries = gen_data(30, d)
+
+    idx = IvfPqIndex(dim=d, nlist=nlist, M=M, kmeans_iters=15, seed=4)
+    idx.train(data)
+    idx.add(data)
+    D, L = idx.search(queries, k=10, nprobe=nlist)   # exhaustive probes
+
+    # ADC distances are squared L2 between (q - c) and a quantized residual:
+    # non-negative up to float rounding, and sorted along k.
+    assert (D > -1e-2).all(), f"negative ADC distance: min={D.min()}"
+    assert np.all(np.diff(D, axis=1) >= -1e-3)
+
+    # Each ADC distance should approximate the true distance to that label
+    # within the quantization error scale (loose sanity bound, not tight).
+    true_d = ((queries[:, None, :] - data[L]) ** 2).sum(axis=2)
+    rel_err = np.abs(D - true_d) / (true_d + 1e-6)
+    assert np.median(rel_err) < 0.5, f"median rel err {np.median(rel_err):.3f}"
 
 
 def _build_duplicate_heavy(q):

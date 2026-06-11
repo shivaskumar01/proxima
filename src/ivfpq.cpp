@@ -100,7 +100,33 @@ void IvfPqIndex::train(const float* data, std::size_t n) {
     inv_codes_.assign(nlist_, {});
     ntotal_ = 0;
     rebuild_codebooks_T();
+    rebuild_precomputed_table();
     trained_ = true;
+}
+
+void IvfPqIndex::rebuild_precomputed_table() {
+    // cb_norm[m*KSUB + k] = ||r_mk||^2, shared across all coarse centroids.
+    std::vector<float> cb_norm(M_ * KSUB);
+    for (std::size_t m = 0; m < M_; ++m) {
+        const float* cb_m = pq_codebooks_.data() + m * KSUB * dsub_;
+        for (std::size_t k = 0; k < KSUB; ++k) {
+            const float* r = cb_m + k * dsub_;
+            cb_norm[m * KSUB + k] = dot(r, r, dsub_);
+        }
+    }
+    precomp_.assign(nlist_ * M_ * KSUB, 0.0f);
+    parallel_for(nlist_, [&](std::size_t c) {
+        const float* cc  = coarse_centroids_.data() + c * dim_;
+        float*       dst = precomp_.data() + c * M_ * KSUB;
+        for (std::size_t m = 0; m < M_; ++m) {
+            const float* c_m  = cc + m * dsub_;
+            const float* cb_m = pq_codebooks_.data() + m * KSUB * dsub_;
+            for (std::size_t k = 0; k < KSUB; ++k) {
+                dst[m * KSUB + k] = cb_norm[m * KSUB + k] +
+                    2.0f * dot(c_m, cb_m + k * dsub_, dsub_);
+            }
+        }
+    });
 }
 
 void IvfPqIndex::rebuild_codebooks_T() {
@@ -188,22 +214,22 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
     struct SearchCtx {
         std::vector<float>   coarse_d;
         std::vector<int32_t> coarse_idx;
-        std::vector<float>   residual;
+        std::vector<float>   qdot;   // -2 * <q_m, r_mk>, built once per query
         std::vector<float>   lut;
     };
     parallel_for<SearchCtx>(nq,
-        [nlist = nlist_, dim = dim_, M = M_]() {
+        [nlist = nlist_, M = M_]() {
             SearchCtx c;
             c.coarse_d.resize(nlist);
             c.coarse_idx.resize(nlist);
-            c.residual.resize(dim);
+            c.qdot.resize(M * KSUB);
             c.lut.resize(M * KSUB);
             return c;
         },
         [&](std::size_t qi, SearchCtx& ctx) {
             auto& coarse_d   = ctx.coarse_d;
             auto& coarse_idx = ctx.coarse_idx;
-            auto& residual   = ctx.residual;
+            auto& qdot       = ctx.qdot;
             auto& lut        = ctx.lut;
         const float* q = queries + qi * dim_;
 
@@ -223,74 +249,89 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
                 [&](int32_t a, int32_t b) { return coarse_d[a] < coarse_d[b]; });
         }
 
+        // 2. Build the query dot-table ONCE: qdot[m*KSUB+k] = -2 <q_m, r_mk>.
+        //    Same NEON tile as the old per-probe LUT build (transposed
+        //    codebooks, 16 entries in 4 registers across the dsub
+        //    reduction), but amortized across all nprobe probes — this was
+        //    the only remaining O(M*KSUB*dsub) term per probe.
+        for (std::size_t m = 0; m < M_; ++m) {
+            const float* q_m    = q + m * dsub_;
+            const float* cb_T_m = pq_codebooks_T_.data() + m * dsub_ * KSUB;
+            float*       qd_m   = qdot.data() + m * KSUB;
+
+#if defined(__ARM_NEON)
+            for (std::size_t k_start = 0; k_start < KSUB; k_start += 16) {
+                float32x4_t a0 = vdupq_n_f32(0.0f);
+                float32x4_t a1 = vdupq_n_f32(0.0f);
+                float32x4_t a2 = vdupq_n_f32(0.0f);
+                float32x4_t a3 = vdupq_n_f32(0.0f);
+                for (std::size_t j = 0; j < dsub_; ++j) {
+                    float32x4_t q_v = vdupq_n_f32(q_m[j]);
+                    const float* cb_row = cb_T_m + j * KSUB + k_start;
+                    a0 = vfmaq_f32(a0, q_v, vld1q_f32(cb_row));
+                    a1 = vfmaq_f32(a1, q_v, vld1q_f32(cb_row + 4));
+                    a2 = vfmaq_f32(a2, q_v, vld1q_f32(cb_row + 8));
+                    a3 = vfmaq_f32(a3, q_v, vld1q_f32(cb_row + 12));
+                }
+                const float32x4_t m2 = vdupq_n_f32(-2.0f);
+                vst1q_f32(qd_m + k_start,      vmulq_f32(a0, m2));
+                vst1q_f32(qd_m + k_start +  4, vmulq_f32(a1, m2));
+                vst1q_f32(qd_m + k_start +  8, vmulq_f32(a2, m2));
+                vst1q_f32(qd_m + k_start + 12, vmulq_f32(a3, m2));
+            }
+#else
+            std::memset(qd_m, 0, KSUB * sizeof(float));
+            for (std::size_t j = 0; j < dsub_; ++j) {
+                float q_j = q_m[j];
+                const float* cb_row = cb_T_m + j * KSUB;
+                for (std::size_t k = 0; k < KSUB; ++k) {
+                    qd_m[k] += q_j * cb_row[k];
+                }
+            }
+            for (std::size_t k = 0; k < KSUB; ++k) qd_m[k] *= -2.0f;
+#endif
+        }
+
         std::priority_queue<HeapEntry> top;
 
         for (std::size_t p = 0; p < nprobe; ++p) {
             int32_t c = coarse_idx[p];
 
-            // Empty list: skip BEFORE paying for the residual + LUT build
-            // (M * KSUB * dsub FLOPs for zero scannable codes). Matters
-            // whenever nlist is large relative to n or lists are skewed.
+            // Empty list: skip BEFORE paying for the LUT merge.
             const auto& labels_c = inv_labels_[c];
             const auto& codes_c  = inv_codes_[c];
             const std::size_t n_c = labels_c.size();
             if (n_c == 0) continue;
 
-            const float* cv = coarse_centroids_.data() + c * dim_;
-
-            // 2. Residual = q - centroid.
-            for (std::size_t j = 0; j < dim_; ++j) residual[j] = q[j] - cv[j];
-
-            // 3. Build ADC lookup table for this list.
-            //    LUT[m*KSUB + k] = ||residual_m - codebook[m][k]||^2.
-            //    The transposed codebook lets us stream 16 LUT entries at a
-            //    time in 4 NEON registers, accumulating across all dsub
-            //    dimensions before storing — no LUT load/store in the inner
-            //    loop. KSUB=256 divides evenly by 16, no tail handling.
-            for (std::size_t m = 0; m < M_; ++m) {
-                const float* r_m    = residual.data() + m * dsub_;
-                const float* cb_T_m = pq_codebooks_T_.data() + m * dsub_ * KSUB;
-                float*       lut_m  = lut.data() + m * KSUB;
-
+            // 3. Per-probe LUT is now a streaming MERGE of two tables plus
+            //    the coarse-distance bias — no dsub factor:
+            //      lut[m][k] = precomp[c][m][k] + qdot[m][k]
+            //    with bias = ||q - c||^2 (already computed by the coarse
+            //    scan) folded into subspace 0 so the scan loop is unchanged.
+            const float* pc = precomp_.data() +
+                static_cast<std::size_t>(c) * M_ * KSUB;
+            const float  bias = coarse_d[c];
+            const std::size_t total = M_ * KSUB;
 #if defined(__ARM_NEON)
-                for (std::size_t k_start = 0; k_start < KSUB; k_start += 16) {
-                    float32x4_t lut0 = vdupq_n_f32(0.0f);
-                    float32x4_t lut1 = vdupq_n_f32(0.0f);
-                    float32x4_t lut2 = vdupq_n_f32(0.0f);
-                    float32x4_t lut3 = vdupq_n_f32(0.0f);
-                    for (std::size_t j = 0; j < dsub_; ++j) {
-                        float32x4_t r_v = vdupq_n_f32(r_m[j]);
-                        const float* cb_row = cb_T_m + j * KSUB + k_start;
-                        float32x4_t cb0 = vld1q_f32(cb_row);
-                        float32x4_t cb1 = vld1q_f32(cb_row + 4);
-                        float32x4_t cb2 = vld1q_f32(cb_row + 8);
-                        float32x4_t cb3 = vld1q_f32(cb_row + 12);
-                        float32x4_t d0 = vsubq_f32(cb0, r_v);
-                        float32x4_t d1 = vsubq_f32(cb1, r_v);
-                        float32x4_t d2 = vsubq_f32(cb2, r_v);
-                        float32x4_t d3 = vsubq_f32(cb3, r_v);
-                        lut0 = vfmaq_f32(lut0, d0, d0);
-                        lut1 = vfmaq_f32(lut1, d1, d1);
-                        lut2 = vfmaq_f32(lut2, d2, d2);
-                        lut3 = vfmaq_f32(lut3, d3, d3);
-                    }
-                    vst1q_f32(lut_m + k_start,      lut0);
-                    vst1q_f32(lut_m + k_start +  4, lut1);
-                    vst1q_f32(lut_m + k_start +  8, lut2);
-                    vst1q_f32(lut_m + k_start + 12, lut3);
-                }
-#else
-                std::memset(lut_m, 0, KSUB * sizeof(float));
-                for (std::size_t j = 0; j < dsub_; ++j) {
-                    float r_j = r_m[j];
-                    const float* cb_row = cb_T_m + j * KSUB;
-                    for (std::size_t k = 0; k < KSUB; ++k) {
-                        float diff = cb_row[k] - r_j;
-                        lut_m[k] += diff * diff;
-                    }
-                }
-#endif
+            for (std::size_t i = 0; i < total; i += 16) {
+                vst1q_f32(lut.data() + i,
+                          vaddq_f32(vld1q_f32(pc + i), vld1q_f32(qdot.data() + i)));
+                vst1q_f32(lut.data() + i + 4,
+                          vaddq_f32(vld1q_f32(pc + i + 4), vld1q_f32(qdot.data() + i + 4)));
+                vst1q_f32(lut.data() + i + 8,
+                          vaddq_f32(vld1q_f32(pc + i + 8), vld1q_f32(qdot.data() + i + 8)));
+                vst1q_f32(lut.data() + i + 12,
+                          vaddq_f32(vld1q_f32(pc + i + 12), vld1q_f32(qdot.data() + i + 12)));
             }
+            const float32x4_t bias_v = vdupq_n_f32(bias);
+            for (std::size_t k = 0; k < KSUB; k += 4) {
+                vst1q_f32(lut.data() + k,
+                          vaddq_f32(vld1q_f32(lut.data() + k), bias_v));
+            }
+#else
+            for (std::size_t i = 0; i < total; ++i) lut[i] = pc[i] + qdot[i];
+            for (std::size_t k = 0; k < KSUB; ++k) lut[k] += bias;
+#endif
 
             // 4. Scan the inverted list, summing the LUT for each code.
             //    Unrolled 4 codes wide: a single code's sum is a serial
@@ -416,6 +457,7 @@ IvfPqIndex IvfPqIndex::load(const std::string& path) {
         r.read_raw(idx.pq_codebooks_.data(),
                    idx.pq_codebooks_.size() * sizeof(float));
         idx.rebuild_codebooks_T();
+        idx.rebuild_precomputed_table();
 
         idx.inv_labels_.assign(nlist, {});
         idx.inv_codes_.assign(nlist, {});

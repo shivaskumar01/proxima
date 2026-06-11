@@ -43,6 +43,7 @@ set(CORE_SRC
   src/kmeans.cpp
   src/hnsw.cpp
   src/ivfpq.cpp
+  src/ivfpq_fs.cpp
 )
 
 add_library(vectordb_core STATIC ${CORE_SRC})

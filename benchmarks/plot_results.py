@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "benchmarks"))
 
-from vectordb import HnswIndex, IvfPqIndex                          # noqa: E402
+from vectordb import HnswIndex, IvfPqIndex, IvfPqFastScan          # noqa: E402
 from sift_loader import fvecs_read, fvecs_chunks, fvecs_shape, ivecs_read  # noqa: E402
 import sift_loader                                                  # noqa: E402
 import gist_loader                                                  # noqa: E402
@@ -57,6 +57,8 @@ SERIES = [
     "faiss-IVFPQ(M=8)",
     "ours-IVFPQ(M=16)",
     "faiss-IVFPQ(M=16)",
+    "ours-IVFPQfs(M=32)",
+    "faiss-IVFPQfs(M=32)",
 ]
 
 EF_GRID = [16, 32, 64, 128, 256]
@@ -158,6 +160,35 @@ def run_series(dataset: str, name: str) -> list[tuple[float, float]]:
             print(f"  faiss-HNSW efS={ef:<3}  recall={r:.3f}  qps={qps:.0f}", flush=True)
             pts.append((r, qps))
 
+    elif "IVFPQfs" in name:
+        # 4-bit fast-scan: M=32 x 4 bits = 16-byte codes (byte parity with
+        # the M=16 8-bit series).
+        M = 32
+        nlist = ivfpq_nlist(n_base)
+        n_train = ivfpq_ntrain(n_base, nlist)
+        xt = fvecs_read(paths["base"], 0, n_train)
+        if name.startswith("ours"):
+            idx = IvfPqFastScan(dim=d, nlist=nlist, M=M, kmeans_iters=15, seed=42)
+        else:
+            quantizer = faiss.IndexFlatL2(d)
+            idx = faiss.IndexIVFPQFastScan(quantizer, d, nlist, M, 4)
+        idx.train(xt)
+        del xt
+        for c in chunks():
+            idx.add(c)
+        print(f"  train+add: {time.perf_counter() - t0:.1f}s", flush=True)
+        settle()
+        for nprobe in NPROBE_GRID:
+            if name.startswith("ours"):
+                qps, lbl = time_qps(lambda q: idx.search(q, k=10, nprobe=nprobe), xq)
+            else:
+                idx.nprobe = nprobe
+                qps, _ = time_qps(lambda q: idx.search(q, 10), xq)
+                _, lbl = idx.search(xq, 10)
+            r = recall_at_k(lbl, gt, k=10)
+            print(f"  {name} nprobe={nprobe:<3}  recall={r:.3f}  qps={qps:.0f}", flush=True)
+            pts.append((r, qps))
+
     elif name.startswith("ours-IVFPQ") or name.startswith("faiss-IVFPQ"):
         M = 8 if "M=8" in name else 16
         nlist = ivfpq_nlist(n_base)
@@ -226,6 +257,8 @@ def plot(dataset: str) -> None:
         "faiss-IVFPQ(M=8)":  dict(marker="s", linestyle="--", color="C1", alpha=0.6),
         "ours-IVFPQ(M=16)":  dict(marker="^", linestyle="-",  color="C2"),
         "faiss-IVFPQ(M=16)": dict(marker="^", linestyle="--", color="C2", alpha=0.6),
+        "ours-IVFPQfs(M=32)":  dict(marker="D", linestyle="-",  color="C3"),
+        "faiss-IVFPQfs(M=32)": dict(marker="D", linestyle="--", color="C3", alpha=0.6),
     }
     for name in SERIES:
         pts = series.get(name)

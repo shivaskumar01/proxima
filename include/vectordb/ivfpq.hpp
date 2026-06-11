@@ -78,12 +78,25 @@ private:
     std::vector<float> pq_codebooks_;
 
     // Transposed PQ codebooks: M * dsub * KSUB. Indexed as
-    // [m*dsub*KSUB + j*KSUB + k]. Used by the LUT build path so the inner
-    // loop strides contiguously across all 256 codes for one (m, j) pair —
-    // enables a 4-wide NEON FMA tile and turns the LUT build (which used
-    // to be ~70% of search time at high nprobe) into a streaming kernel.
+    // [m*dsub*KSUB + j*KSUB + k]. Used by the per-query dot-table build so
+    // the inner loop strides contiguously across all 256 codes for one
+    // (m, j) pair — enables a 4-wide NEON FMA tile.
     std::vector<float> pq_codebooks_T_;
     void rebuild_codebooks_T();
+
+    // Precomputed ADC term (FAISS's use_precomputed_table): expanding
+    //   ||(q - c) - r||^2 = ||q - c||^2 + (||r||^2 + 2<c_m, r>) - 2<q_m, r>
+    // the middle term depends only on (coarse centroid, codebook entry).
+    // precomp_[c*M*KSUB + m*KSUB + k] = ||r_mk||^2 + 2<c_m, r_mk>.
+    // ||q - c||^2 is the coarse distance (already computed by the coarse
+    // scan) and folds in as a per-probe scalar; -2<q_m, r_mk> is built once
+    // per QUERY. The per-probe LUT build drops from O(M*KSUB*dsub) FLOPs to
+    // an O(M*KSUB) table merge — the dsub factor (120 on GIST1M with M=8)
+    // is why FAISS used to win GIST IVF-PQ at every nprobe.
+    // Size nlist*M*KSUB floats (8-16 MB typical); rebuilt by train()/load(),
+    // never serialized.
+    std::vector<float> precomp_;
+    void rebuild_precomputed_table();
 
     // Inverted lists. Parallel arrays so labels and codes each stream
     // contiguously during scan; interleaving (label,code,label,code) would

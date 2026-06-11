@@ -1,6 +1,7 @@
 #include "vectordb/flat.hpp"
 #include "vectordb/hnsw.hpp"
 #include "vectordb/ivfpq.hpp"
+#include "vectordb/ivfpq_fs.hpp"
 #include "vectordb/types.hpp"
 
 #include <pybind11/pybind11.h>
@@ -168,4 +169,51 @@ PYBIND11_MODULE(_vectordb, m) {
         .def_property_readonly("nlist", &IvfPqIndex::nlist)
         .def_property_readonly("M",     &IvfPqIndex::M)
         .def("list_sizes", &IvfPqIndex::list_sizes);
+
+    // ---- IvfPqFastScan ----------------------------------------------------
+    py::class_<IvfPqFastScan>(m, "IvfPqFastScan")
+        .def(py::init<std::size_t, std::size_t, std::size_t,
+                      std::size_t, uint64_t>(),
+             py::arg("dim"), py::arg("nlist"), py::arg("M"),
+             py::arg("kmeans_iters") = 20, py::arg("seed") = 42)
+        .def("train",
+             [](IvfPqFastScan& self, FloatArr data) {
+                 std::size_t n;
+                 const float* p = check_2d_dim(data, self.dim(), "data", &n);
+                 py::gil_scoped_release release;
+                 self.train(p, n);
+             },
+             py::arg("data"))
+        .def("add",
+             [](IvfPqFastScan& self, FloatArr data) {
+                 std::size_t n;
+                 const float* p = check_2d_dim(data, self.dim(), "data", &n);
+                 py::gil_scoped_release release;
+                 self.add(p, n);
+             },
+             py::arg("data"))
+        .def("search",
+             [](const IvfPqFastScan& self, FloatArr queries,
+                std::size_t k, std::size_t nprobe) {
+                 std::size_t nq;
+                 const float* q = check_2d_dim(queries, self.dim(), "queries", &nq);
+                 py::array_t<float>   dists({nq, k});
+                 py::array_t<label_t> labels({nq, k});
+                 float*   d_ptr = static_cast<float*>(dists.request().ptr);
+                 label_t* l_ptr = static_cast<label_t*>(labels.request().ptr);
+                 {
+                     py::gil_scoped_release release;
+                     self.search(q, nq, k, nprobe, d_ptr, l_ptr);
+                 }
+                 return std::make_pair(dists, labels);
+             },
+             py::arg("queries"), py::arg("k"), py::arg("nprobe") = 8)
+        .def("save", &IvfPqFastScan::save, py::arg("path"))
+        .def_static("load", &IvfPqFastScan::load, py::arg("path"))
+        .def_property_readonly("is_trained", &IvfPqFastScan::is_trained)
+        .def_property_readonly("size",  &IvfPqFastScan::size)
+        .def_property_readonly("dim",   &IvfPqFastScan::dim)
+        .def_property_readonly("nlist", &IvfPqFastScan::nlist)
+        .def_property_readonly("M",     &IvfPqFastScan::M)
+        .def("list_sizes", &IvfPqFastScan::list_sizes);
 }

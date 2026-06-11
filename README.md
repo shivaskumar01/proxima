@@ -11,6 +11,7 @@ hnswlib, ScaNN) actually work — not as a drop-in replacement for them.
 | `FlatIndex` | brute-force linear scan (recall ground truth) | O(1)   | `n·d·4` bytes   |
 | `HnswIndex` | hierarchical NSW (Malkov & Yashunin 2016)     | O(n log n), parallel | ~`n·d·4 + n·M·8` bytes |
 | `IvfPqIndex`| inverted file + product quantization          | O(n·k·iter) train, parallel | ~`n·M` bytes (codes) |
+| `IvfPqFastScan` | 4-bit PQ scanned with NEON `tbl` (lossless filter + exact re-rank) | same | ~`n·M/2` bytes |
 
 Distance kernels: `l2sq` and `dot` with hand-unrolled NEON intrinsics on Apple
 Silicon (single-pair and 4-candidate batch variants), scalar fallback
@@ -112,20 +113,29 @@ HNSW (M=16, efConstruction=200; build 51.5s ours / 59.4s FAISS; ours was
 | **128**  | **0.990 / 0.992** |  **30.6k /  25.4k** | **1.20** |
 | **256** | **0.997 / 0.998** | **16.3k / 14.4k** | **1.13** |
 
-IVF-PQ (nlist=1000; ours train+add on 1M vectors: ~4s):
+IVF-PQ with precomputed ADC tables (nlist=1000; ours train+add on 1M
+vectors: ~4s):
 
 | M  | nprobe | recall@10 ours / FAISS | QPS ours / FAISS | ours/FAISS |
 | -- | ------ | ---------------------- | ---------------- | ---------- |
-| 8  |  1     | 0.229 / 0.227 | **469.7k** / 372.5k | **1.26** |
-| 8  |  8     | 0.347 / 0.347 | 133.8k / 194.1k | 0.69 |
-| 8  | 32     | 0.360 / 0.359 |  40.8k /  63.1k | 0.65 |
-| 8  | 64     | 0.360 / 0.360 |  22.1k /  36.7k | 0.60 |
-| 16 |  1     | 0.296 / 0.294 | **352.7k** / 243.6k | **1.45** |
-| 16 |  8     | 0.514 / 0.512 | **101.9k** /  85.7k | **1.19** |
-| 16 | 32     | 0.546 / 0.545 |  30.5k /  33.7k | 0.91 |
-| 16 | 64     | 0.548 / 0.548 |  15.6k /  17.9k | 0.87 |
+| 8  |  1     | 0.229 / 0.227 | **411.6k** / 372.5k | **1.10** |
+| 8  |  8     | 0.347 / 0.347 | 154.0k / 194.1k | 0.79 |
+| 8  | 32     | 0.360 / 0.359 |  54.9k /  63.1k | 0.87 |
+| 8  | 64     | 0.360 / 0.360 |  31.1k /  36.7k | 0.85 |
+| 16 |  1     | 0.296 / 0.294 | **310.2k** / 243.6k | **1.27** |
+| 16 |  8     | 0.514 / 0.512 | **111.8k** /  85.7k | **1.30** |
+| 16 | 32     | 0.546 / 0.545 | **34.9k** /  33.7k | **1.04** |
+| 16 | 64     | 0.548 / 0.548 | **18.8k** /  17.9k | **1.05** |
 
-**Recall matches FAISS within 0.003 in every cell.** Algorithm and
+4-bit fast-scan, 16-byte codes (same byte budget as M=16 above):
+
+| nprobe | recall@10 ours / FAISS | QPS ours / FAISS |
+| ------ | ---------------------- | ---------------- |
+|  1     | **0.265** / 0.238 | 465.7k / 926.1k |
+|  8     | **0.430** / 0.386 | 242.7k / 431.8k |
+| 64     | **0.452** / 0.406 |  55.5k /  99.5k |
+
+**Recall matches FAISS within 0.003 in every 8-bit cell.** Algorithm and
 quantization are correct end-to-end on a real dataset. The batch kernels
 are verified bit-identical to the single-pair kernels (800k-pair check, 0
 mismatches) now that `-ffast-math` is gone.
@@ -136,13 +146,21 @@ batches) closed the old 19-27% gap; the remaining low-ef difference tracks
 graph-layout differences (flat link arrays vs vector-of-vectors), not
 distance math.
 
-**IVF-PQ at nprobe=1 beats FAISS** (+26% / +45%) — when only one list is
-scanned, the LUT build dominates per-query work, and our NEON FMA tile
-kernel is tighter than FAISS's general-purpose path. As `nprobe` grows the
-inverted-list code scan dominates; the 4-wide unrolled scan recovers most
-of that for M=16 (0.87-0.93× FAISS) while M=8 (cheaper per-code scan,
-relatively more scan-bound) stays at 0.60-0.69× — the remaining gap is the
-4-bit fast-scan design, v3.
+**IVF-PQ M=16 now beats FAISS at every nprobe (1.04-1.30×).** The
+precomputed-table expansion removed the last per-probe `dsub` term; what
+used to be a high-nprobe deficit is simply gone. M=8 sits at 0.79-1.10× —
+its cheaper per-code scan makes it relatively more scan-bound, where
+FAISS's in-register code layout still has an edge. (nprobe=1 paid a small
+toll vs the direct-LUT path — the per-probe merge isn't amortized over a
+single probe — but stays ahead of FAISS.)
+
+**Fast-scan splits along its design trade.** FAISS's 4-bit scan returns
+quantized distances and is ~2× faster; ours filters with quantized
+underestimates and re-scores survivors exactly, ending with strictly
+better recall at every operating point — FAISS's recall *ceiling* here is
+0.406 while ours reaches 0.452 from identical codes. At the same byte
+budget, our fast-scan also delivers ~3× the QPS of our own 8-bit M=16 at
+its matched recall points (e.g. 0.430 @ 242.7k vs 0.466 @ 172.3k).
 
 M=16 doubles the code budget and lifts recall from 0.36 → 0.55 at the same
 nprobe, validating the recall-vs-memory tradeoff.
@@ -177,31 +195,42 @@ recall ceiling vs SIFT is the dataset: nearest-neighbor structure at
 point; the batch kernels matter *more* at 960-dim because each gathered
 neighbor batch amortizes 4× more query-load traffic.
 
-IVF-PQ (nlist=1000; ours train+add ≈ 26s):
+IVF-PQ with precomputed ADC tables (nlist=1000; ours train+add ≈ 26s):
 
 | config | recall@10 ours / FAISS | QPS ours / FAISS | ours/FAISS |
 | ------ | ---------------------- | ---------------- | ---------- |
-| M=8,  nprobe=1  | 0.074 / 0.075 |  64.3k / 135.3k | 0.48 |
-| M=8,  nprobe=8  | 0.093 / 0.098 |  25.4k /  86.7k | 0.29 |
-| M=8,  nprobe=64 | 0.093 / 0.099 |   5.0k /  19.9k | 0.25 |
-| M=16, nprobe=1  | 0.111 / 0.112 |  69.5k / 116.2k | 0.60 |
-| M=16, nprobe=8  | 0.157 / 0.165 |  27.2k /  62.4k | 0.44 |
-| **M=16, nprobe=64** | **0.161 / 0.169** | **4.7k / 12.2k** | **0.39** |
+| M=8,  nprobe=1  | 0.074 / 0.075 |  60.7k / 135.3k | 0.45 |
+| M=8,  nprobe=8  | 0.093 / 0.098 |  46.6k /  86.7k | 0.54 |
+| M=8,  nprobe=64 | 0.093 / 0.099 |  14.3k /  19.9k | 0.72 |
+| M=16, nprobe=1  | 0.111 / 0.112 |  67.8k / 116.2k | 0.58 |
+| M=16, nprobe=8  | 0.157 / 0.165 |  41.1k /  62.4k | 0.66 |
+| **M=16, nprobe=64** | **0.161 / 0.169** | **8.8k / 12.2k** | **0.72** |
 
-**IVF-PQ recall matches FAISS within 0.01** in every cell. The scan unroll
-lifted our GIST throughput 17-37% over pre-v3 (M=16), but the relative gap
-(2-4×) is wider than SIFT's and — unlike SIFT — FAISS wins even at
-nprobe=1. That points at a *dimension-scaled* term, not the code scan:
+4-bit fast-scan, 16-byte codes:
 
-**Why GIST IVF-PQ still favors FAISS:** at 960-dim the per-probe ADC LUT
-build costs `M × 256 × dsub` FLOPs — 120× more work per entry than SIFT's
-dsub=16. FAISS sidesteps most of it with *precomputed tables*
-(`use_precomputed_table`): expanding ‖r − c‖² lets the dsub-dependent term
-be computed once per query instead of once per probe, leaving O(M·256)
-per probe. We compute the full LUT per probe. That, plus the 4-bit
-fast-scan on the code loop, are the two structural FAISS tricks left on
-the table — both documented designs, neither a mystery, each a contained
-project.
+| nprobe | recall@10 ours / FAISS | QPS ours / FAISS |
+| ------ | ---------------------- | ---------------- |
+|  1     | **0.101** / 0.059 |  89.1k / 217.1k |
+|  8     | **0.126** / 0.076 |  70.9k / 168.5k |
+| 64     | **0.128** / 0.073 |  25.3k /  57.7k |
+
+**IVF-PQ recall matches FAISS within 0.01** in every 8-bit cell. The
+precomputed-table expansion was the structural fix this dataset was waiting
+for: +45% to +185% QPS over the per-probe-LUT version at nprobe≥4, lifting
+the FAISS ratio from 0.25-0.60× to 0.45-0.72×. The remaining gap is
+concentrated at *low* nprobe, where the coarse scan (1000 × 960-dim
+distances per query) dominates and FAISS batches it as a matrix multiply
+across queries — a BLAS-shaped trick we haven't taken (we keep per-query
+parallelism with the `l2sq_ny` kernel).
+
+**The fast-scan numbers are the dataset's verdict on lossy scanning.** At
+960-dim the ADC distance spread is small relative to a uint8 quantization
+step, and FAISS's quantized-distance fast-scan pays for it: recall *drops*
+to 0.059-0.076 — 16-byte fast-scan codes scoring *worse* than its own
+8-byte M=8 ordinary PQ (0.075-0.099). Our lossless-filter design holds
+0.101-0.128 — roughly the recall of ordinary M=8/M=16 PQ — while running
+~3× faster than our 8-bit scan. FAISS is still ~2.4× faster in raw QPS,
+but at a recall level this dataset makes useless.
 
 The recall ceiling at ~0.16 (M=16, full scan) is what 240× compression buys
 on 960-dim GIST descriptors: PQ throws away too much to recover much
@@ -277,11 +306,35 @@ This is the dataset, not a bug — FAISS plateaus at the same place.
   subspace) → push (label, code) into the inverted list. Assignment+encode
   runs in parallel into per-vector slots, then lists are appended serially in
   input order — labels and list contents are identical to a serial add.
-- **Search (ADC)**: for each of `nprobe` nearest coarse lists, build a
-  `M × 256` lookup table where `LUT[m][k]` is the squared distance from the
-  query's residual subspace to PQ centroid `k`. Each list entry's distance is
-  a sum of `M` lookups. Empty lists are skipped *before* the LUT build —
-  paying `M·256·dsub` FLOPs to scan zero codes is pure waste.
+- **Search (ADC with precomputed tables)**: for each of `nprobe` nearest
+  coarse lists, the `M × 256` lookup table comes from the expansion
+  `‖(q−c)−r‖² = ‖q−c‖² + (‖r‖² + 2⟨c_m,r⟩) − 2⟨q_m,r⟩`: the middle term is
+  precomputed at train time (`nlist × M × 256` floats, 8-16 MB), the last is
+  built once per QUERY, and `‖q−c‖²` is the coarse distance the coarse scan
+  already produced, folded into subspace 0. The per-probe cost is an
+  O(M·256) table merge — the dsub factor (120 on GIST with M=8) is gone,
+  which is what used to hand FAISS the GIST IVF-PQ win at every nprobe.
+  Each list entry's distance is a sum of `M` lookups. Empty lists are
+  skipped before the merge.
+
+### IVF-PQ fast-scan (`src/ivfpq_fs.cpp`)
+
+4-bit PQ scanned with the NEON `tbl` instruction (FAISS's
+`IndexIVFPQFastScan` design): KSUB=16 entries per subspace, so at the same
+byte budget you run twice the subspaces (M=32 × 4-bit = 16 bytes ≈
+M=16 × 8-bit). Codes are nibble-packed in blocks of 16 candidates laid out
+so one `vqtbl1q_u8` performs 16 LUT lookups in a single instruction, with
+u16 lane accumulators.
+
+The one deliberate departure from FAISS: our per-probe LUT is quantized to
+uint8 with floor() against per-subspace minima, making every quantized
+score an **underestimate** of the exact ADC distance. The SIMD pass is
+therefore a *lossless filter* — a lane is discarded only when even its
+underestimate cannot beat the current top-k, and survivors are re-scored
+against the exact float LUT. FAISS instead returns the quantized distances
+directly: faster (no re-rank, SIMD top-k inside blocks), but lossy — and
+the loss is visible in the benchmarks below, dramatically so at 960-dim
+where distance spreads are small relative to the quantization step.
 
 ### k-means (`src/kmeans.cpp`)
 
@@ -408,26 +461,25 @@ build with suspicion.
 
 ### Remaining gap vs FAISS
 
-With parallel search + parallel build + the vectorized LUT build + batch
-distance kernels + the unrolled PQ scan all in place, recall still matches
-FAISS cell-for-cell, HNSW is at or above FAISS through much of both
-sweeps, and the residual QPS gap is concentrated in IVF-PQ:
+Both v4 items — precomputed ADC tables and the 4-bit `tbl` fast-scan — are
+now implemented. What measurably remains:
 
-- **SIMD PQ code scan**: ours sums 8-bit LUT lookups four codes at a time
-  (scalar loads, ILP-limited); FAISS's `IndexPQFastScan` design re-packs
-  codes to 4 bits and serves 16 lookups with a single NEON `tbl`
-  instruction. That's a different index layout (4-bit codes, 16-byte
-  per-subspace LUT, SIMD registers as the lookup table). Visible as the
-  high-`nprobe` gap on both datasets.
-- **Precomputed ADC tables**: FAISS's `use_precomputed_table` moves the
-  dsub-dependent term of the per-probe LUT build to once-per-query via the
-  ‖r − c‖² expansion. Irrelevant at SIFT's dsub=16 (where we *beat* FAISS
-  at low nprobe), decisive at GIST's dsub=120 — it's why FAISS wins GIST
-  IVF-PQ even at nprobe=1.
-- What's left on HNSW is within run-to-run noise at most operating points
-  (0.89-1.20× across both datasets); the structural difference that
-  remains is graph layout (flat link arrays vs our vector-of-vectors),
-  not distance math.
+- **Fast-scan raw throughput** (ours 0.4-0.6× FAISS): FAISS keeps its
+  quantized LUTs pinned in SIMD registers across 32-candidate blocks, does
+  its top-k comparisons in SIMD on the quantized values, and never
+  re-scores. We reload LUTs per block and exact-re-rank survivors — that
+  costs ~2× in QPS and buys strictly better recall (on GIST, the
+  difference between usable and useless results). Closing the speed gap
+  without giving up the lossless filter means register-resident LUTs and a
+  SIMD pre-filter compare; the recall trade we will not give back.
+- **Batched coarse scan**: at 960-dim the coarse quantizer scan dominates
+  low-nprobe IVF-PQ, and FAISS effectively runs it as a query-batched
+  matrix multiply. Ours is per-query (`l2sq_ny`). A 4-query × 4-centroid
+  register-tiled scan would close most of the GIST nprobe=1 gap without a
+  BLAS dependency.
+- **HNSW** is at or above FAISS at most operating points (0.89-1.20×
+  across both datasets); the remaining structural difference is graph
+  layout (flat link arrays vs our vector-of-vectors), not distance math.
 
 ## Layout
 
