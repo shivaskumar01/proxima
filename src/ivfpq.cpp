@@ -17,11 +17,12 @@
 namespace vectordb {
 
 IvfPqIndex::IvfPqIndex(std::size_t dim, std::size_t nlist, std::size_t M,
-                       std::size_t kmeans_iters, uint64_t seed)
+                       std::size_t kmeans_iters, uint64_t seed, Metric metric)
     : dim_(dim), nlist_(nlist), M_(M),
       dsub_(M == 0 ? 0 : dim / M),
       kmeans_iters_(kmeans_iters),
-      seed_(seed) {
+      seed_(seed),
+      metric_(metric) {
     if (dim == 0)   throw std::invalid_argument("IVF-PQ: dim must be > 0");
     if (nlist == 0) throw std::invalid_argument("IVF-PQ: nlist must be > 0");
     if (M == 0)     throw std::invalid_argument("IVF-PQ: M must be > 0");
@@ -52,15 +53,20 @@ void IvfPqIndex::train(const float* data, std::size_t n) {
     kmeans(data, n, dim_, nlist_, kmeans_iters_, seed_,
            coarse_centroids_, &coarse_assign, /*nthreads=*/0);
 
-    // 2. Compute residuals: r_i = x_i - coarse_centroid[assign_i].
-    //    Stored densely as n * dim, then sliced per subspace for PQ training.
-    std::vector<float> residuals(static_cast<std::size_t>(n) * dim_);
-    parallel_for(n, [&](std::size_t i) {
-        const float* x = data + i * dim_;
-        const float* c = coarse_centroids_.data() + coarse_assign[i] * dim_;
-        float* r = residuals.data() + i * dim_;
-        for (std::size_t j = 0; j < dim_; ++j) r[j] = x[j] - c[j];
-    });
+    // 2. PQ training input: residuals for L2 (r_i = x_i - centroid), the raw
+    //    vectors for IP (no residual encoding — see header).
+    const float* pq_train = data;
+    std::vector<float> residuals;
+    if (metric_ == Metric::L2) {
+        residuals.resize(static_cast<std::size_t>(n) * dim_);
+        parallel_for(n, [&](std::size_t i) {
+            const float* x = data + i * dim_;
+            const float* c = coarse_centroids_.data() + coarse_assign[i] * dim_;
+            float* r = residuals.data() + i * dim_;
+            for (std::size_t j = 0; j < dim_; ++j) r[j] = x[j] - c[j];
+        });
+        pq_train = residuals.data();
+    }
 
     // 3. Train one PQ codebook per subspace on the residual slice.
     //    Subspaces are independent → train them in parallel. Each thread keeps
@@ -80,7 +86,7 @@ void IvfPqIndex::train(const float* data, std::size_t n) {
         [&](std::size_t m, PqCtx& ctx) {
             for (std::size_t i = 0; i < n; ++i) {
                 std::memcpy(ctx.sub_buf.data() + i * dsub_,
-                            residuals.data() + i * dim_ + m * dsub_,
+                            pq_train + i * dim_ + m * dsub_,
                             dsub_ * sizeof(float));
             }
             // nthreads=1: this loop is already one thread per subspace;
@@ -101,7 +107,11 @@ void IvfPqIndex::train(const float* data, std::size_t n) {
     inv_codes_.assign(nlist_, {});
     ntotal_ = 0;
     rebuild_codebooks_T();
-    rebuild_precomputed_table();
+    if (metric_ == Metric::L2) {
+        rebuild_precomputed_table();   // IP has no per-probe centroid term
+    } else {
+        precomp_.clear();
+    }
     trained_ = true;
 }
 
@@ -152,13 +162,20 @@ void IvfPqIndex::encode_vector(const float* x, int32_t coarse_id,
     const float* c = coarse_centroids_.data() + coarse_id * dim_;
     for (std::size_t m = 0; m < M_; ++m) {
         const float* x_m = x + m * dsub_;
-        const float* c_m = c + m * dsub_;
-        for (std::size_t j = 0; j < dsub_; ++j) {
-            r_sub_scratch[j] = x_m[j] - c_m[j];
+        const float* src = x_m;
+        if (metric_ == Metric::L2) {
+            const float* c_m = c + m * dsub_;
+            for (std::size_t j = 0; j < dsub_; ++j) {
+                r_sub_scratch[j] = x_m[j] - c_m[j];
+            }
+            src = r_sub_scratch;
         }
+        // Codebook assignment is always nearest-by-L2: PQ minimizes
+        // reconstruction error of the encoded vector; the metric only
+        // changes how reconstructed vectors are SCORED at search time.
         const float* cb = pq_codebooks_.data() + m * KSUB * dsub_;
         out_code[m] = static_cast<uint8_t>(
-            nearest_centroid(r_sub_scratch, cb, KSUB, dsub_));
+            nearest_centroid(src, cb, KSUB, dsub_));
     }
 }
 
@@ -176,8 +193,9 @@ void IvfPqIndex::add(const float* data, std::size_t n) {
         [dsub = dsub_]() { return std::vector<float>(dsub); },  // residual scratch
         [&](std::size_t i, std::vector<float>& r_sub) {
             const float* x = data + i * dim_;
-            coarse[i] = nearest_centroid(x, coarse_centroids_.data(),
-                                         nlist_, dim_);
+            coarse[i] = (metric_ == Metric::L2)
+                ? nearest_centroid(x, coarse_centroids_.data(), nlist_, dim_)
+                : nearest_centroid_ip(x, coarse_centroids_.data(), nlist_, dim_);
             encode_vector(x, coarse[i], codes.data() + i * M_, r_sub.data());
         });
 
@@ -227,7 +245,7 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
     // at GIST (960-dim, 3.8 MB of centroid reads per query) and a 5-15%
     // LOSS at SIFT (128-dim, 0.5 MB) where the round-trip dominates the
     // saving. Gate on per-query coarse traffic.
-    const bool batched_coarse =
+    const bool batched_coarse = metric_ == Metric::L2 &&
         nlist_ * dim_ * sizeof(float) >= (std::size_t{1} << 20);
     std::vector<float> coarse_all(
         batched_coarse ? std::min(nq, kCoarseSlab) * nlist_ : 0);
@@ -260,9 +278,18 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
         const float* coarse_d;
         if (batched_coarse) {
             coarse_d = coarse_all.data() + si * nlist_;
-        } else {
+        } else if (metric_ == Metric::L2) {
             l2sq_ny(ctx.coarse_d.data(), q, coarse_centroids_.data(),
                     nlist_, dim_);
+            coarse_d = ctx.coarse_d.data();
+        } else {
+            // IP: probe lists by max dot; store negated so smaller-is-better
+            // machinery (sort, heap) is shared with L2.
+            dot_ny(ctx.coarse_d.data(), q, coarse_centroids_.data(),
+                   nlist_, dim_);
+            for (std::size_t c = 0; c < nlist_; ++c) {
+                ctx.coarse_d[c] = -ctx.coarse_d[c];
+            }
             coarse_d = ctx.coarse_d.data();
         }
         for (std::size_t c = 0; c < nlist_; ++c) {
@@ -278,11 +305,12 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
                 [&](int32_t a, int32_t b) { return coarse_d[a] < coarse_d[b]; });
         }
 
-        // 2. Build the query dot-table ONCE: qdot[m*KSUB+k] = -2 <q_m, r_mk>.
-        //    Same NEON tile as the old per-probe LUT build (transposed
-        //    codebooks, 16 entries in 4 registers across the dsub
-        //    reduction), but amortized across all nprobe probes — this was
-        //    the only remaining O(M*KSUB*dsub) term per probe.
+        // 2. Build the query dot-table ONCE: qdot[m*KSUB+k] = s * <q_m, r_mk>
+        //    with s = -2 for the L2 expansion and s = -1 for IP (where the
+        //    negated dot table IS the whole ADC table — no per-probe work).
+        //    Same NEON tile (transposed codebooks, 16 entries in 4 registers
+        //    across the dsub reduction), amortized across all probes.
+        const float qdot_scale = (metric_ == Metric::L2) ? -2.0f : -1.0f;
         for (std::size_t m = 0; m < M_; ++m) {
             const float* q_m    = q + m * dsub_;
             const float* cb_T_m = pq_codebooks_T_.data() + m * dsub_ * KSUB;
@@ -302,7 +330,7 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
                     a2 = vfmaq_f32(a2, q_v, vld1q_f32(cb_row + 8));
                     a3 = vfmaq_f32(a3, q_v, vld1q_f32(cb_row + 12));
                 }
-                const float32x4_t m2 = vdupq_n_f32(-2.0f);
+                const float32x4_t m2 = vdupq_n_f32(qdot_scale);
                 vst1q_f32(qd_m + k_start,      vmulq_f32(a0, m2));
                 vst1q_f32(qd_m + k_start +  4, vmulq_f32(a1, m2));
                 vst1q_f32(qd_m + k_start +  8, vmulq_f32(a2, m2));
@@ -317,7 +345,7 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
                     qd_m[k] += q_j * cb_row[k];
                 }
             }
-            for (std::size_t k = 0; k < KSUB; ++k) qd_m[k] *= -2.0f;
+            for (std::size_t k = 0; k < KSUB; ++k) qd_m[k] *= qdot_scale;
 #endif
         }
 
@@ -332,11 +360,14 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
             const std::size_t n_c = labels_c.size();
             if (n_c == 0) continue;
 
-            // 3. Per-probe LUT is now a streaming MERGE of two tables plus
-            //    the coarse-distance bias — no dsub factor:
-            //      lut[m][k] = precomp[c][m][k] + qdot[m][k]
-            //    with bias = ||q - c||^2 (already computed by the coarse
-            //    scan) folded into subspace 0 so the scan loop is unchanged.
+            // 3. Per-probe ADC table.
+            //    L2: streaming MERGE of two tables plus the coarse bias —
+            //      lut[m][k] = precomp[c][m][k] + qdot[m][k], with
+            //      bias = ||q - c||^2 folded into subspace 0.
+            //    IP: the (negated) query dot-table IS the table — no
+            //      per-probe work at all; just point at it.
+            const float* lut_p = qdot.data();   // IP: dot table IS the table
+            if (metric_ == Metric::L2) {
             const float* pc = precomp_.data() +
                 static_cast<std::size_t>(c) * M_ * KSUB;
             const float  bias = coarse_d[c];
@@ -361,6 +392,8 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
             for (std::size_t i = 0; i < total; ++i) lut[i] = pc[i] + qdot[i];
             for (std::size_t k = 0; k < KSUB; ++k) lut[k] += bias;
 #endif
+            lut_p = lut.data();
+            }
 
             // 4. Scan the inverted list, summing the LUT for each code.
             //    Unrolled 4 codes wide: a single code's sum is a serial
@@ -388,7 +421,7 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
                 __builtin_prefetch(c3 + 4 * M_, 0, 0);
                 float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
                 for (std::size_t m = 0; m < M_; ++m) {
-                    const float* lut_m = lut.data() + m * KSUB;
+                    const float* lut_m = lut_p + m * KSUB;
                     s0 += lut_m[c0[m]];
                     s1 += lut_m[c1[m]];
                     s2 += lut_m[c2[m]];
@@ -403,17 +436,18 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
                 const uint8_t* code = codes_p + i * M_;
                 float dist = 0.0f;
                 for (std::size_t m = 0; m < M_; ++m) {
-                    dist += lut[m * KSUB + code[m]];
+                    dist += lut_p[m * KSUB + code[m]];
                 }
                 consider(dist, i);
             }
         }
 
+        const bool is_l2 = (metric_ == Metric::L2);
         std::size_t out_n = std::min(k, top.size());
         for (std::size_t j = 0; j < out_n; ++j) {
             std::size_t pos = out_n - 1 - j;
             const HeapEntry& e = top.top();
-            out_distances[qi * k + pos] = e.distance;
+            out_distances[qi * k + pos] = is_l2 ? e.distance : -e.distance;
             out_labels[qi * k + pos]    = e.label;
             top.pop();
         }
@@ -430,7 +464,8 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
 void IvfPqIndex::save(const std::string& path) const {
     io::Writer w(path);
     w.write_magic("VIP1");
-    w.write_pod<uint32_t>(1);
+    w.write_pod<uint32_t>(2);                  // v2 adds the metric byte
+    w.write_pod<uint8_t>(metric_ == Metric::L2 ? 0 : 1);
     w.write_pod<uint64_t>(dim_);
     w.write_pod<uint64_t>(nlist_);
     w.write_pod<uint64_t>(M_);
@@ -458,7 +493,14 @@ IvfPqIndex IvfPqIndex::load(const std::string& path) {
     io::Reader r(path);
     r.check_magic("VIP1");
     uint32_t version = r.read_pod<uint32_t>();
-    if (version != 1) throw std::runtime_error("IvfPqIndex: unsupported file version");
+    if (version != 1 && version != 2) {
+        throw std::runtime_error("IvfPqIndex: unsupported file version");
+    }
+    // v1 files predate metric support and are always L2.
+    Metric metric = Metric::L2;
+    if (version == 2 && r.read_pod<uint8_t>() != 0) {
+        metric = Metric::InnerProduct;
+    }
 
     uint64_t dim    = r.read_pod<uint64_t>();
     uint64_t nlist  = r.read_pod<uint64_t>();
@@ -470,7 +512,7 @@ IvfPqIndex IvfPqIndex::load(const std::string& path) {
     IvfPqIndex idx(static_cast<std::size_t>(dim),
                    static_cast<std::size_t>(nlist),
                    static_cast<std::size_t>(M),
-                   /*kmeans_iters=*/20, /*seed=*/0);
+                   /*kmeans_iters=*/20, /*seed=*/0, metric);
     if (idx.dsub_ != dsub) {
         throw std::runtime_error("IvfPqIndex: dsub mismatch");
     }
@@ -487,7 +529,7 @@ IvfPqIndex IvfPqIndex::load(const std::string& path) {
         r.read_raw(idx.pq_codebooks_.data(),
                    idx.pq_codebooks_.size() * sizeof(float));
         idx.rebuild_codebooks_T();
-        idx.rebuild_precomputed_table();
+        if (metric == Metric::L2) idx.rebuild_precomputed_table();
 
         idx.inv_labels_.assign(nlist, {});
         idx.inv_codes_.assign(nlist, {});

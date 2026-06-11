@@ -31,4 +31,10 @@ void kmeans(const float* data, std::size_t n, std::size_t dim,
 int32_t nearest_centroid(const float* x, const float* centroids,
                          std::size_t k, std::size_t dim) noexcept;
 
+// Argmax-inner-product variant: the assignment rule for inner-product IVF
+// indexes (list membership and probe selection must agree, and both go by
+// max <x, centroid> when the metric is IP). Batched 4 rows at a time.
+int32_t nearest_centroid_ip(const float* x, const float* centroids,
+                            std::size_t k, std::size_t dim) noexcept;
+
 }  // namespace vectordb

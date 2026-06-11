@@ -26,15 +26,18 @@ namespace vectordb {
 //     re-scored exactly against the float LUT, so results are exact ADC
 //     top-k — quantization never costs recall.
 //
-// Shares the precomputed-table ADC expansion with IvfPqIndex (per-probe LUT
-// is a streaming merge, no dsub factor). L2 only; dim % M == 0; M even.
+// Shares the precomputed-table ADC expansion with IvfPqIndex for L2; for
+// InnerProduct (raw-vector encoding, FAISS-style) the dot table is
+// probe-independent, so the LUT is built AND quantized once per query.
+// dim % M == 0; M even. Cosine = normalize vectors + queries, use "ip".
 class IvfPqFastScan {
 public:
     IvfPqFastScan(std::size_t dim,
                   std::size_t nlist,
                   std::size_t M,            // # 4-bit subquantizers (even)
                   std::size_t kmeans_iters = 20,
-                  uint64_t    seed = 42);
+                  uint64_t    seed = 42,
+                  Metric      metric = Metric::L2);
 
     void train(const float* data, std::size_t n);
     void add(const float* data, std::size_t n);
@@ -48,6 +51,7 @@ public:
     std::size_t dim()  const noexcept { return dim_; }
     std::size_t nlist() const noexcept { return nlist_; }
     std::size_t M()     const noexcept { return M_; }
+    Metric      metric() const noexcept { return metric_; }
 
     std::vector<std::size_t> list_sizes() const;
 
@@ -74,6 +78,7 @@ private:
     std::size_t dsub_;
     std::size_t kmeans_iters_;
     uint64_t    seed_;
+    Metric      metric_;
 
     bool        trained_ = false;
     std::size_t ntotal_  = 0;

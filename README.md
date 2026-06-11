@@ -19,6 +19,16 @@ elsewhere. Construction is multi-threaded end-to-end: HNSW inserts in
 parallel with hnswlib-style per-node locking, IVF-PQ parallelizes k-means
 assignment, PQ codebook training, and encoding.
 
+**Metrics:** every index supports `metric="l2"` and `metric="ip"` (inner
+product; cosine = normalize your vectors and queries first). IP IVF-PQ
+follows FAISS's raw-vector-encoding design but measures *better* than
+`faiss.IndexIVFPQ(..., METRIC_INNER_PRODUCT)` on both axes — recall 0.231
+vs 0.153 at exhaustive probes and ~2x the QPS at low nprobe on a 50k x 128
+normalized synthetic check. (FAISS's own docs steer users away from its
+IVFPQ-IP path; the measurement agrees.) For IP the ADC table depends only
+on the query — built once, zero per-probe table work — and the fast-scan
+variant quantizes once per query too.
+
 ## Build
 
 ```bash
@@ -31,7 +41,7 @@ cmake --build build -j
 ```
 
 The compiled extension lands in `python/vectordb/_vectordb.*.so`. The Python
-shim (`python/vectordb/__init__.py`) re-exports the three index classes, so
+shim (`python/vectordb/__init__.py`) re-exports the four index classes, so
 benchmarks and tests just `from vectordb import HnswIndex`.
 
 ## Use
@@ -53,6 +63,12 @@ ivf = IvfPqIndex(dim=128, nlist=1024, M=8)
 ivf.train(xb[:50_000])
 ivf.add(xb)
 D, I = ivf.search(xq, k=10, nprobe=8)
+
+# Cosine / inner product (normalize for cosine; D returns dot products,
+# descending). IvfPqFastScan takes the same kwarg.
+xn = xb / np.linalg.norm(xb, axis=1, keepdims=True)
+ip = IvfPqIndex(dim=128, nlist=1024, M=8, metric="ip")
+ip.train(xn[:50_000]); ip.add(xn)
 
 # Persistence — round-trip preserves search results bit-for-bit.
 idx.save("hnsw.bin")

@@ -9,21 +9,31 @@
 
 namespace vectordb {
 
-// IVF-PQ: coarse Inverted-File partitioning + Product Quantization on the
-// residuals. Memory ~ M bytes per vector; search is dominated by an L1-resident
-// lookup-table sum over M subspaces per probed list entry.
+// IVF-PQ: coarse Inverted-File partitioning + Product Quantization. Memory
+// ~ M bytes per vector; search is dominated by an L1-resident lookup-table
+// sum over M subspaces per probed list entry.
+//
+// Metrics (following FAISS's IndexIVFPQ design):
+//   - L2: PQ encodes RESIDUALS (x - coarse centroid); ADC uses the
+//     precomputed-table expansion (see precomp_ below).
+//   - InnerProduct: PQ encodes RAW vectors (residual-IP needs norm
+//     bookkeeping for little gain — FAISS also defaults by_residual=false
+//     for IP). score = sum_m <q_m, y_m>, so the ADC table depends only on
+//     the query: built once per query, ZERO per-probe table work. Lists are
+//     assigned and probed by max <x, centroid>. Cosine = normalize your
+//     vectors and queries, then use "ip".
 //
 // Constraints:
 //   - dim must be divisible by M (so each subspace has dsub = dim / M dims)
 //   - ksub fixed at 256 (one byte per subspace code)
-//   - L2 metric only in this version (residual-IP requires norms bookkeeping)
 class IvfPqIndex {
 public:
     IvfPqIndex(std::size_t dim,
                std::size_t nlist,        // # coarse centroids (e.g. 1024)
                std::size_t M,            // # PQ subspaces (e.g. 8 or 16)
                std::size_t kmeans_iters = 20,
-               uint64_t    seed = 42);
+               uint64_t    seed = 42,
+               Metric      metric = Metric::L2);
 
     // Train both the coarse quantizer and the PQ codebooks.
     void train(const float* data, std::size_t n);
@@ -41,6 +51,7 @@ public:
     std::size_t dim()  const noexcept { return dim_; }
     std::size_t nlist() const noexcept { return nlist_; }
     std::size_t M()     const noexcept { return M_; }
+    Metric      metric() const noexcept { return metric_; }
 
     // Diagnostic: per-list vector count.
     std::vector<std::size_t> list_sizes() const;
@@ -66,6 +77,7 @@ private:
     std::size_t dsub_;
     std::size_t kmeans_iters_;
     uint64_t    seed_;
+    Metric      metric_;
 
     bool        trained_ = false;
     std::size_t ntotal_  = 0;

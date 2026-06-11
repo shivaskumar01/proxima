@@ -125,10 +125,15 @@ PYBIND11_MODULE(_vectordb, m) {
 
     // ---- IvfPqIndex -------------------------------------------------------
     py::class_<IvfPqIndex>(m, "IvfPqIndex")
-        .def(py::init<std::size_t, std::size_t, std::size_t,
-                      std::size_t, uint64_t>(),
+        .def(py::init([](std::size_t dim, std::size_t nlist, std::size_t M,
+                         std::size_t kmeans_iters, uint64_t seed,
+                         std::string metric) {
+                 return new IvfPqIndex(dim, nlist, M, kmeans_iters, seed,
+                                       parse_metric(metric));
+             }),
              py::arg("dim"), py::arg("nlist"), py::arg("M"),
-             py::arg("kmeans_iters") = 20, py::arg("seed") = 42)
+             py::arg("kmeans_iters") = 20, py::arg("seed") = 42,
+             py::arg("metric") = "l2")
         .def("train",
              [](IvfPqIndex& self, FloatArr data) {
                  std::size_t n;
@@ -172,10 +177,15 @@ PYBIND11_MODULE(_vectordb, m) {
 
     // ---- IvfPqFastScan ----------------------------------------------------
     py::class_<IvfPqFastScan>(m, "IvfPqFastScan")
-        .def(py::init<std::size_t, std::size_t, std::size_t,
-                      std::size_t, uint64_t>(),
+        .def(py::init([](std::size_t dim, std::size_t nlist, std::size_t M,
+                         std::size_t kmeans_iters, uint64_t seed,
+                         std::string metric) {
+                 return new IvfPqFastScan(dim, nlist, M, kmeans_iters, seed,
+                                          parse_metric(metric));
+             }),
              py::arg("dim"), py::arg("nlist"), py::arg("M"),
-             py::arg("kmeans_iters") = 20, py::arg("seed") = 42)
+             py::arg("kmeans_iters") = 20, py::arg("seed") = 42,
+             py::arg("metric") = "l2")
         .def("train",
              [](IvfPqFastScan& self, FloatArr data) {
                  std::size_t n;

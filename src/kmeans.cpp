@@ -34,6 +34,29 @@ int32_t nearest_centroid(const float* x, const float* centroids,
     return best;
 }
 
+int32_t nearest_centroid_ip(const float* x, const float* centroids,
+                            std::size_t k, std::size_t dim) noexcept {
+    int32_t best   = 0;
+    float   best_d = std::numeric_limits<float>::lowest();
+    float d4[4];
+    std::size_t c = 0;
+    for (; c + 4 <= k; c += 4) {
+        const float* row = centroids + c * dim;
+        dot_x4(x, row, row + dim, row + 2 * dim, row + 3 * dim, dim, d4);
+        for (int j = 0; j < 4; ++j) {
+            if (d4[j] > best_d) {
+                best_d = d4[j];
+                best   = static_cast<int32_t>(c + j);
+            }
+        }
+    }
+    for (; c < k; ++c) {
+        float d = dot(x, centroids + c * dim, dim);
+        if (d > best_d) { best_d = d; best = static_cast<int32_t>(c); }
+    }
+    return best;
+}
+
 namespace {
 
 // k-means++ seeding: each new centroid is sampled with probability

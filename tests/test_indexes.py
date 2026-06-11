@@ -729,6 +729,89 @@ def test_hnsw_duplicate_heavy_build_terminates():
     assert qout.get() == 1
 
 
+# ---- inner-product IVF-PQ --------------------------------------------------
+
+def test_ivfpq_ip_recall_vs_flat():
+    """IP IVF-PQ (raw-vector encoding, max-dot list assignment) should reach
+    PQ-appropriate recall against the exact IP ground truth."""
+    d, M, nlist, n = 32, 8, 16, 4000
+    data = gen_data(n, d)
+    queries = gen_data(50, d)
+
+    flat = FlatIndex(dim=d, metric="ip")
+    flat.add(data)
+    _, truth = flat.search(queries, k=10)
+
+    idx = IvfPqIndex(dim=d, nlist=nlist, M=M, kmeans_iters=15, seed=6,
+                     metric="ip")
+    idx.train(data)
+    idx.add(data)
+    D, pred = idx.search(queries, k=10, nprobe=nlist)
+    r = recall_at_k(pred, truth, k=10)
+    assert r >= 0.30, f"IP recall@10 too low: {r}"
+    # Scores are dot products: descending along k, top-1 close to the true max.
+    assert np.all(np.diff(D, axis=1) <= 1e-3)
+    true_best = (data @ queries.T).max(axis=0)
+    assert np.median(np.abs(D[:, 0] - true_best) / np.abs(true_best)) < 0.5
+
+
+def test_ivfpqfs_ip_recall_vs_flat():
+    d, M, nlist, n = 32, 16, 16, 4000
+    data = gen_data(n, d)
+    queries = gen_data(50, d)
+
+    flat = FlatIndex(dim=d, metric="ip")
+    flat.add(data)
+    _, truth = flat.search(queries, k=10)
+
+    fs = IvfPqFastScan(dim=d, nlist=nlist, M=M, kmeans_iters=15, seed=6,
+                       metric="ip")
+    fs.train(data)
+    fs.add(data)
+    D, pred = fs.search(queries, k=10, nprobe=nlist)
+    r = recall_at_k(pred, truth, k=10)
+    assert r >= 0.30, f"fast-scan IP recall@10 too low: {r}"
+    assert np.all(np.diff(D, axis=1) <= 1e-3)
+
+
+def test_ivfpq_cosine_pattern():
+    """Cosine = normalize database + queries, then metric='ip'. Top results
+    should match numpy cosine-similarity ranking reasonably well."""
+    d, n = 32, 3000
+    data = gen_data(n, d)
+    data /= np.linalg.norm(data, axis=1, keepdims=True)
+    queries = gen_data(30, d)
+    queries /= np.linalg.norm(queries, axis=1, keepdims=True)
+
+    truth = np.argsort(-(data @ queries.T), axis=0)[:10].T  # (30, 10)
+
+    idx = IvfPqIndex(dim=d, nlist=16, M=8, kmeans_iters=15, seed=8,
+                     metric="ip")
+    idx.train(data)
+    idx.add(data)
+    _, pred = idx.search(queries, k=10, nprobe=16)
+    assert recall_at_k(pred, truth, k=10) >= 0.30
+
+
+def test_ivfpq_ip_save_load(tmp_path):
+    """v2 file format round-trips the metric; results identical after load."""
+    d = 32
+    data = gen_data(2000, d)
+    queries = gen_data(30, d)
+    for cls, name in ((IvfPqIndex, "ivf_ip.bin"), (IvfPqFastScan, "fs_ip.bin")):
+        idx = cls(dim=d, nlist=8, M=8, kmeans_iters=10, seed=3, metric="ip")
+        idx.train(data)
+        idx.add(data)
+        D1, L1 = idx.search(queries, k=5, nprobe=4)
+
+        p = str(tmp_path / name)
+        idx.save(p)
+        loaded = cls.load(p)
+        D2, L2 = loaded.search(queries, k=5, nprobe=4)
+        assert np.array_equal(L1, L2), name
+        assert np.allclose(D1, D2), name
+
+
 # ---- multithread safety -------------------------------------------------
 
 def test_concurrent_search_threadsafe():

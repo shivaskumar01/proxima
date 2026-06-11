@@ -17,11 +17,13 @@
 namespace vectordb {
 
 IvfPqFastScan::IvfPqFastScan(std::size_t dim, std::size_t nlist, std::size_t M,
-                             std::size_t kmeans_iters, uint64_t seed)
+                             std::size_t kmeans_iters, uint64_t seed,
+                             Metric metric)
     : dim_(dim), nlist_(nlist), M_(M),
       dsub_(M == 0 ? 0 : dim / M),
       kmeans_iters_(kmeans_iters),
-      seed_(seed) {
+      seed_(seed),
+      metric_(metric) {
     if (dim == 0)   throw std::invalid_argument("IVF-PQ-FS: dim must be > 0");
     if (nlist == 0) throw std::invalid_argument("IVF-PQ-FS: nlist must be > 0");
     if (M == 0)     throw std::invalid_argument("IVF-PQ-FS: M must be > 0");
@@ -49,14 +51,19 @@ void IvfPqFastScan::train(const float* data, std::size_t n) {
     kmeans(data, n, dim_, nlist_, kmeans_iters_, seed_,
            coarse_centroids_, &coarse_assign, /*nthreads=*/0);
 
-    // 2. Residuals.
-    std::vector<float> residuals(static_cast<std::size_t>(n) * dim_);
-    parallel_for(n, [&](std::size_t i) {
-        const float* x = data + i * dim_;
-        const float* c = coarse_centroids_.data() + coarse_assign[i] * dim_;
-        float* r = residuals.data() + i * dim_;
-        for (std::size_t j = 0; j < dim_; ++j) r[j] = x[j] - c[j];
-    });
+    // 2. PQ training input: residuals for L2, raw vectors for IP.
+    const float* pq_train = data;
+    std::vector<float> residuals;
+    if (metric_ == Metric::L2) {
+        residuals.resize(static_cast<std::size_t>(n) * dim_);
+        parallel_for(n, [&](std::size_t i) {
+            const float* x = data + i * dim_;
+            const float* c = coarse_centroids_.data() + coarse_assign[i] * dim_;
+            float* r = residuals.data() + i * dim_;
+            for (std::size_t j = 0; j < dim_; ++j) r[j] = x[j] - c[j];
+        });
+        pq_train = residuals.data();
+    }
 
     // 3. One 16-entry codebook per subspace, trained in parallel across M.
     pq_codebooks_.assign(M_ * KSUB * dsub_, 0.0f);
@@ -72,7 +79,7 @@ void IvfPqFastScan::train(const float* data, std::size_t n) {
         [&](std::size_t m, PqCtx& ctx) {
             for (std::size_t i = 0; i < n; ++i) {
                 std::memcpy(ctx.sub_buf.data() + i * dsub_,
-                            residuals.data() + i * dim_ + m * dsub_,
+                            pq_train + i * dim_ + m * dsub_,
                             dsub_ * sizeof(float));
             }
             kmeans(ctx.sub_buf.data(), n, dsub_, KSUB, kmeans_iters_,
@@ -87,7 +94,11 @@ void IvfPqFastScan::train(const float* data, std::size_t n) {
     inv_packed_.assign(nlist_, {});
     ntotal_ = 0;
     rebuild_codebooks_T();
-    rebuild_precomputed_table();
+    if (metric_ == Metric::L2) {
+        rebuild_precomputed_table();
+    } else {
+        precomp_.clear();
+    }
     trained_ = true;
 }
 
@@ -135,13 +146,17 @@ void IvfPqFastScan::encode_vector(const float* x, int32_t coarse_id,
     const float* c = coarse_centroids_.data() + coarse_id * dim_;
     for (std::size_t m = 0; m < M_; ++m) {
         const float* x_m = x + m * dsub_;
-        const float* c_m = c + m * dsub_;
-        for (std::size_t j = 0; j < dsub_; ++j) {
-            r_sub_scratch[j] = x_m[j] - c_m[j];
+        const float* src = x_m;
+        if (metric_ == Metric::L2) {
+            const float* c_m = c + m * dsub_;
+            for (std::size_t j = 0; j < dsub_; ++j) {
+                r_sub_scratch[j] = x_m[j] - c_m[j];
+            }
+            src = r_sub_scratch;
         }
         const float* cb = pq_codebooks_.data() + m * KSUB * dsub_;
         out_code[m] = static_cast<uint8_t>(
-            nearest_centroid(r_sub_scratch, cb, KSUB, dsub_));
+            nearest_centroid(src, cb, KSUB, dsub_));
     }
 }
 
@@ -156,8 +171,9 @@ void IvfPqFastScan::add(const float* data, std::size_t n) {
         [dsub = dsub_]() { return std::vector<float>(dsub); },
         [&](std::size_t i, std::vector<float>& r_sub) {
             const float* x = data + i * dim_;
-            coarse[i] = nearest_centroid(x, coarse_centroids_.data(),
-                                         nlist_, dim_);
+            coarse[i] = (metric_ == Metric::L2)
+                ? nearest_centroid(x, coarse_centroids_.data(), nlist_, dim_)
+                : nearest_centroid_ip(x, coarse_centroids_.data(), nlist_, dim_);
             encode_vector(x, coarse[i], codes.data() + i * M_, r_sub.data());
         });
 
@@ -211,7 +227,7 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
     // at GIST (960-dim, 3.8 MB of centroid reads per query) and a 5-15%
     // LOSS at SIFT (128-dim, 0.5 MB) where the round-trip dominates the
     // saving. Gate on per-query coarse traffic.
-    const bool batched_coarse =
+    const bool batched_coarse = metric_ == Metric::L2 &&
         nlist_ * dim_ * sizeof(float) >= (std::size_t{1} << 20);
     std::vector<float> coarse_all(
         batched_coarse ? std::min(nq, kCoarseSlab) * nlist_ : 0);
@@ -244,9 +260,16 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
         const float* coarse_d;
         if (batched_coarse) {
             coarse_d = coarse_all.data() + si * nlist_;
-        } else {
+        } else if (metric_ == Metric::L2) {
             l2sq_ny(ctx.coarse_d.data(), q, coarse_centroids_.data(),
                     nlist_, dim_);
+            coarse_d = ctx.coarse_d.data();
+        } else {
+            dot_ny(ctx.coarse_d.data(), q, coarse_centroids_.data(),
+                   nlist_, dim_);
+            for (std::size_t c = 0; c < nlist_; ++c) {
+                ctx.coarse_d[c] = -ctx.coarse_d[c];
+            }
             coarse_d = ctx.coarse_d.data();
         }
         for (std::size_t c = 0; c < nlist_; ++c) {
@@ -264,6 +287,7 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
 
         // 2. Query dot-table, once per query: qdot[m*16+k] = -2<q_m, r_mk>.
         //    KSUB=16 fits exactly one 4x4-register tile per subspace.
+        const float qdot_scale = (metric_ == Metric::L2) ? -2.0f : -1.0f;
         for (std::size_t m = 0; m < M_; ++m) {
             const float* q_m    = q + m * dsub_;
             const float* cb_T_m = pq_codebooks_T_.data() + m * dsub_ * KSUB;
@@ -281,7 +305,7 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
                 a2 = vfmaq_f32(a2, q_v, vld1q_f32(row + 8));
                 a3 = vfmaq_f32(a3, q_v, vld1q_f32(row + 12));
             }
-            const float32x4_t m2 = vdupq_n_f32(-2.0f);
+            const float32x4_t m2 = vdupq_n_f32(qdot_scale);
             vst1q_f32(qd_m,      vmulq_f32(a0, m2));
             vst1q_f32(qd_m +  4, vmulq_f32(a1, m2));
             vst1q_f32(qd_m +  8, vmulq_f32(a2, m2));
@@ -293,40 +317,26 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
                 const float* row = cb_T_m + j * KSUB;
                 for (std::size_t kk = 0; kk < KSUB; ++kk) qd_m[kk] += q_j * row[kk];
             }
-            for (std::size_t kk = 0; kk < KSUB; ++kk) qd_m[kk] *= -2.0f;
+            for (std::size_t kk = 0; kk < KSUB; ++kk) qd_m[kk] *= qdot_scale;
 #endif
         }
 
         std::priority_queue<HeapEntry> top;
 
-        for (std::size_t p = 0; p < nprobe; ++p) {
-            const int32_t c = coarse_idx[p];
-            const auto& labels_c = inv_labels_[c];
-            const auto& packed_c = inv_packed_[c];
-            const std::size_t n_c = labels_c.size();
-            if (n_c == 0) continue;
-
-            // 3. Exact float LUT: precomp + qdot, coarse bias folded into
-            //    subspace 0 (each candidate sums exactly one entry from it).
-            const float* pc = precomp_.data() +
-                static_cast<std::size_t>(c) * M_ * KSUB;
-            const float bias = coarse_d[c];
-            float* lut_f = ctx.lut_f.data();
-            for (std::size_t i = 0; i < M_ * KSUB; ++i) {
-                lut_f[i] = pc[i] + ctx.qdot[i];
-            }
-            for (std::size_t kk = 0; kk < KSUB; ++kk) lut_f[kk] += bias;
-
-            // 4. Quantize to uint8 underestimates: per-subspace bias = min,
-            //    shared scale = max subspace range / 255, floor rounding.
-            //    quantized_sum * qdelta + qbase <= exact distance, so a lane
-            //    is pruned only when even its underestimate cannot beat the
-            //    current top-k — the SIMD pass is a lossless filter (up to
-            //    float rounding in the quantizer itself).
+        // ADC table + uint8 quantization (per-subspace bias = min, shared
+        // scale = max subspace range / 255, floor rounding → quantized sums
+        // UNDERESTIMATE exact distances, so the SIMD pass is a lossless
+        // filter). For L2 both happen per probe (the table depends on the
+        // probed centroid); for IP the negated dot table IS the table and
+        // is probe-independent — built and quantized ONCE per query.
+        const float* lut_f = ctx.qdot.data();
+        uint8_t* lut8 = ctx.lut8.data();
+        float qdelta = 1.0f, inv_delta = 1.0f, qbase = 0.0f;
+        auto quantize = [&](const float* lf) {
             float* bmin = ctx.bmin.data();
             float maxrange = 0.0f;
             for (std::size_t m = 0; m < M_; ++m) {
-                const float* lm = lut_f + m * KSUB;
+                const float* lm = lf + m * KSUB;
                 float lo = lm[0], hi = lm[0];
                 for (std::size_t kk = 1; kk < KSUB; ++kk) {
                     lo = std::min(lo, lm[kk]);
@@ -335,18 +345,41 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
                 bmin[m] = lo;
                 maxrange = std::max(maxrange, hi - lo);
             }
-            const float qdelta = maxrange > 0.0f ? maxrange / 255.0f : 1.0f;
-            float qbase = 0.0f;
+            qdelta = maxrange > 0.0f ? maxrange / 255.0f : 1.0f;
+            inv_delta = 1.0f / qdelta;
+            qbase = 0.0f;
             for (std::size_t m = 0; m < M_; ++m) qbase += bmin[m];
-            uint8_t* lut8 = ctx.lut8.data();
-            const float inv_delta = 1.0f / qdelta;
             for (std::size_t m = 0; m < M_; ++m) {
-                const float* lm = lut_f + m * KSUB;
+                const float* lm = lf + m * KSUB;
                 uint8_t* l8 = lut8 + m * KSUB;
                 for (std::size_t kk = 0; kk < KSUB; ++kk) {
                     int v = static_cast<int>((lm[kk] - bmin[m]) * inv_delta);
                     l8[kk] = static_cast<uint8_t>(v > 255 ? 255 : (v < 0 ? 0 : v));
                 }
+            }
+        };
+        if (metric_ != Metric::L2) quantize(lut_f);
+
+        for (std::size_t p = 0; p < nprobe; ++p) {
+            const int32_t c = coarse_idx[p];
+            const auto& labels_c = inv_labels_[c];
+            const auto& packed_c = inv_packed_[c];
+            const std::size_t n_c = labels_c.size();
+            if (n_c == 0) continue;
+
+            if (metric_ == Metric::L2) {
+                // Exact float LUT: precomp + qdot, coarse bias folded into
+                // subspace 0; then re-quantize for this probe.
+                const float* pc = precomp_.data() +
+                    static_cast<std::size_t>(c) * M_ * KSUB;
+                const float bias = coarse_d[c];
+                float* lf = ctx.lut_f.data();
+                for (std::size_t i = 0; i < M_ * KSUB; ++i) {
+                    lf[i] = pc[i] + ctx.qdot[i];
+                }
+                for (std::size_t kk = 0; kk < KSUB; ++kk) lf[kk] += bias;
+                lut_f = lf;
+                quantize(lut_f);
             }
 
             auto exact_rescore = [&](const uint8_t* bp, std::size_t lane) {
@@ -462,11 +495,12 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
             }
         }
 
+        const bool is_l2 = (metric_ == Metric::L2);
         std::size_t out_n = std::min(k, top.size());
         for (std::size_t j = 0; j < out_n; ++j) {
             std::size_t pos = out_n - 1 - j;
             const HeapEntry& e = top.top();
-            out_distances[qi * k + pos] = e.distance;
+            out_distances[qi * k + pos] = is_l2 ? e.distance : -e.distance;
             out_labels[qi * k + pos]    = e.label;
             top.pop();
         }
@@ -483,7 +517,8 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
 void IvfPqFastScan::save(const std::string& path) const {
     io::Writer w(path);
     w.write_magic("VFS1");
-    w.write_pod<uint32_t>(1);
+    w.write_pod<uint32_t>(2);                  // v2 adds the metric byte
+    w.write_pod<uint8_t>(metric_ == Metric::L2 ? 0 : 1);
     w.write_pod<uint64_t>(dim_);
     w.write_pod<uint64_t>(nlist_);
     w.write_pod<uint64_t>(M_);
@@ -511,8 +546,12 @@ IvfPqFastScan IvfPqFastScan::load(const std::string& path) {
     io::Reader r(path);
     r.check_magic("VFS1");
     uint32_t version = r.read_pod<uint32_t>();
-    if (version != 1) {
+    if (version != 1 && version != 2) {
         throw std::runtime_error("IvfPqFastScan: unsupported file version");
+    }
+    Metric metric = Metric::L2;
+    if (version == 2 && r.read_pod<uint8_t>() != 0) {
+        metric = Metric::InnerProduct;
     }
 
     uint64_t dim    = r.read_pod<uint64_t>();
@@ -525,7 +564,7 @@ IvfPqFastScan IvfPqFastScan::load(const std::string& path) {
     IvfPqFastScan idx(static_cast<std::size_t>(dim),
                       static_cast<std::size_t>(nlist),
                       static_cast<std::size_t>(M),
-                      /*kmeans_iters=*/20, /*seed=*/0);
+                      /*kmeans_iters=*/20, /*seed=*/0, metric);
     if (idx.dsub_ != dsub) {
         throw std::runtime_error("IvfPqFastScan: dsub mismatch");
     }
@@ -541,7 +580,7 @@ IvfPqFastScan IvfPqFastScan::load(const std::string& path) {
         r.read_raw(idx.pq_codebooks_.data(),
                    idx.pq_codebooks_.size() * sizeof(float));
         idx.rebuild_codebooks_T();
-        idx.rebuild_precomputed_table();
+        if (metric == Metric::L2) idx.rebuild_precomputed_table();
 
         const std::size_t bb = idx.block_bytes();
         idx.inv_labels_.assign(nlist, {});
