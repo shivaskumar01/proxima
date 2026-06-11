@@ -19,6 +19,13 @@ public:
     // row-major buffer so search loops stride sequentially through memory.
     void add(const float* data, std::size_t n);
 
+    // Pre-size internal storage for a total of n vectors. Callers streaming
+    // the dataset in chunks should reserve once up front: without it the
+    // backing vector's geometric growth peaks at ~2x the final footprint
+    // during the last realloc (old + new buffer live simultaneously) —
+    // enough to push a 1M x 960 build into swap on a 16 GB machine.
+    void reserve(std::size_t n) { data_.reserve(n * dim_); }
+
     // Top-k nearest neighbors for each of the nq queries.
     // out_distances and out_labels must each have nq * k slots.
     void search(const float* queries, std::size_t nq, std::size_t k,

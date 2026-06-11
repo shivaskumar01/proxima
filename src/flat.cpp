@@ -44,15 +44,34 @@ void FlatIndex::search(const float* queries, std::size_t nq, std::size_t k,
 
         std::priority_queue<HeapEntry> heap;
 
-        for (std::size_t i = 0; i < ntotal_; ++i) {
-            const float* v = data_.data() + i * dim_;
-            float d = is_l2 ? l2sq(q, v, dim_) : -dot(q, v, dim_);
+        auto consider = [&](float d, std::size_t i) {
             if (heap.size() < k) {
                 heap.push({d, static_cast<label_t>(i)});
             } else if (d < heap.top().distance) {
                 heap.pop();
                 heap.push({d, static_cast<label_t>(i)});
             }
+        };
+
+        // Rows are contiguous, so scan 4 at a time with the batch kernel:
+        // the query block is loaded once per 16 floats instead of 4x, and
+        // 16 independent FMA chains keep the pipes full. Heap updates stay
+        // in row order, so results are identical to the one-by-one scan.
+        std::size_t i = 0;
+        float d4[4];
+        for (; i + 4 <= ntotal_; i += 4) {
+            const float* v = data_.data() + i * dim_;
+            if (is_l2) {
+                l2sq_x4(q, v, v + dim_, v + 2 * dim_, v + 3 * dim_, dim_, d4);
+            } else {
+                dot_x4(q, v, v + dim_, v + 2 * dim_, v + 3 * dim_, dim_, d4);
+                for (int j = 0; j < 4; ++j) d4[j] = -d4[j];
+            }
+            for (int j = 0; j < 4; ++j) consider(d4[j], i + j);
+        }
+        for (; i < ntotal_; ++i) {
+            const float* v = data_.data() + i * dim_;
+            consider(is_l2 ? l2sq(q, v, dim_) : -dot(q, v, dim_), i);
         }
 
         std::size_t out_n = std::min(k, heap.size());

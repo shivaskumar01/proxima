@@ -10,3 +10,4 @@ data/
 *.fvecs
 *.ivecs
 benchmarks/results_*.json
+*.zip

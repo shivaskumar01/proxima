@@ -1,15 +1,27 @@
-"""Generate the recall@10 vs QPS plot for SIFT1M.
+"""Generate the recall@10 vs QPS plot for SIFT1M / GIST1M.
 
 This is the standard ANN-benchmark visualization: each (algorithm, parameter)
 cell becomes a point; sweeping the speed/quality knob (efSearch for HNSW,
 nprobe for IVF-PQ) traces a curve. Up-and-right is better.
 
-Output: benchmarks/results_sift1m.png
+Memory model: the default invocation re-execs itself once per series
+(`--series NAME`), so each sweep runs in its own process that loads the
+data, builds ONE index, measures, merges its points into the results JSON,
+and exits. Combined with the chunk-streamed loaders this keeps peak RSS
+around base+index for the current series only (~5 GB for GIST1M) instead of
+accumulating every index and numpy temporary in one long-lived process —
+the all-in-one version drove a 16 GB machine deep into swap on GIST1M,
+where it burned an hour inside the memory compressor without finishing a
+single build.
+
+Output: benchmarks/results_{dataset}.{json,png}
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -21,15 +33,44 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "benchmarks"))
 
-from vectordb import HnswIndex, IvfPqIndex                # noqa: E402
-from sift_loader import load_sift1m                       # noqa: E402
-from gist_loader import load_gist1m                       # noqa: E402
+from vectordb import HnswIndex, IvfPqIndex                          # noqa: E402
+from sift_loader import fvecs_read, fvecs_chunks, fvecs_shape, ivecs_read  # noqa: E402
+import sift_loader                                                  # noqa: E402
+import gist_loader                                                  # noqa: E402
 
 try:
     import faiss
     HAVE_FAISS = True
 except ImportError:
     HAVE_FAISS = False
+
+
+DATASETS = {
+    "sift1m": (sift_loader.DEFAULT_DIR, "sift", "SIFT1M (1M × 128)"),
+    "gist1m": (gist_loader.DEFAULT_DIR, "gist", "GIST1M (1M × 960)"),
+}
+
+SERIES = [
+    "ours-HNSW",
+    "faiss-HNSW",
+    "ours-IVFPQ(M=8)",
+    "faiss-IVFPQ(M=8)",
+    "ours-IVFPQ(M=16)",
+    "faiss-IVFPQ(M=16)",
+]
+
+EF_GRID = [16, 32, 64, 128, 256]
+NPROBE_GRID = [1, 4, 8, 16, 32, 64]
+CHUNK_ROWS = 100_000
+
+
+def dataset_paths(dataset: str) -> dict[str, Path]:
+    root, prefix, _ = DATASETS[dataset]
+    return {
+        "base":  root / f"{prefix}_base.fvecs",
+        "query": root / f"{prefix}_query.fvecs",
+        "gt":    root / f"{prefix}_groundtruth.ivecs",
+    }
 
 
 def recall_at_k(pred: np.ndarray, truth: np.ndarray, k: int) -> float:
@@ -51,109 +92,131 @@ def time_qps(fn, queries, repeats: int = 3) -> tuple[float, np.ndarray]:
     return len(queries) / best, labels
 
 
-def sweep_ours_hnsw(xb, xq, gt, ef_search_grid: Iterable[int]):
-    d = xb.shape[1]
-    print("building ours-HNSW...", flush=True)
-    idx = HnswIndex(dim=d, metric="l2", M=16, ef_construction=200, seed=42)
-    idx.add(xb)
-    pts = []
-    for ef in ef_search_grid:
-        qps, lbl = time_qps(lambda q: idx.search(q, k=10, ef=ef), xq)
-        r = recall_at_k(lbl, gt, k=10)
-        print(f"  ours-HNSW efS={ef:<3}  recall={r:.3f}  qps={qps:.0f}", flush=True)
-        pts.append((r, qps))
+# Index builds saturate every core (both ours and FAISS), which heats the
+# package right before the first search sweep and depresses its QPS by up to
+# ~30%. A short settle keeps the sweep cells comparable to each other.
+SETTLE_S = 15.0
+
+
+def settle() -> None:
+    print(f"  (settling {SETTLE_S:.0f}s after build...)", flush=True)
+    time.sleep(SETTLE_S)
+
+
+def ivfpq_nlist(n_base: int) -> int:
+    return max(64, min(1024, int(np.sqrt(n_base))))
+
+
+def ivfpq_ntrain(n_base: int, nlist: int) -> int:
+    return min(n_base, max(30 * nlist, 10_000))
+
+
+# ---- one sweep per process ------------------------------------------------
+
+def run_series(dataset: str, name: str) -> list[tuple[float, float]]:
+    paths = dataset_paths(dataset)
+    n_base, d = fvecs_shape(paths["base"])
+    xq = fvecs_read(paths["query"])
+    gt = ivecs_read(paths["gt"])
+    chunks = lambda: fvecs_chunks(paths["base"], CHUNK_ROWS)  # noqa: E731
+
+    print(f"[{name}] base=({n_base}, {d})  queries={xq.shape}", flush=True)
+    t0 = time.perf_counter()
+    pts: list[tuple[float, float]] = []
+
+    if name == "ours-HNSW":
+        idx = HnswIndex(dim=d, metric="l2", M=16, ef_construction=200, seed=42)
+        idx.reserve(n_base)   # chunked adds must not pay 2x realloc peaks
+        for c in chunks():
+            idx.add(c)
+        print(f"  build: {time.perf_counter() - t0:.1f}s", flush=True)
+        settle()
+        for ef in EF_GRID:
+            qps, lbl = time_qps(lambda q: idx.search(q, k=10, ef=ef), xq)
+            r = recall_at_k(lbl, gt, k=10)
+            print(f"  ours-HNSW efS={ef:<3}  recall={r:.3f}  qps={qps:.0f}", flush=True)
+            pts.append((r, qps))
+
+    elif name == "faiss-HNSW":
+        idx = faiss.IndexHNSWFlat(d, 16)
+        idx.hnsw.efConstruction = 200
+        # Chunked add. faiss has no reserve(), so each add realloc-copies its
+        # storage vector (brief old+new transients) — but that beats holding
+        # a full 3.8 GB numpy copy NEXT TO faiss's internal copy for the
+        # whole multi-minute build: the full-load variant sat at ~7.7 GB
+        # sustained and swap-thrashed for an hour+ on GIST1M on a 16 GB
+        # machine, exactly like the all-in-one harness used to.
+        for c in chunks():
+            idx.add(c)
+        print(f"  build: {time.perf_counter() - t0:.1f}s", flush=True)
+        settle()
+        for ef in EF_GRID:
+            idx.hnsw.efSearch = ef
+            qps, _ = time_qps(lambda q: idx.search(q, 10), xq)
+            _, lbl = idx.search(xq, 10)
+            r = recall_at_k(lbl, gt, k=10)
+            print(f"  faiss-HNSW efS={ef:<3}  recall={r:.3f}  qps={qps:.0f}", flush=True)
+            pts.append((r, qps))
+
+    elif name.startswith("ours-IVFPQ") or name.startswith("faiss-IVFPQ"):
+        M = 8 if "M=8" in name else 16
+        nlist = ivfpq_nlist(n_base)
+        n_train = ivfpq_ntrain(n_base, nlist)
+        xt = fvecs_read(paths["base"], 0, n_train)   # small contiguous slice
+        if name.startswith("ours"):
+            idx = IvfPqIndex(dim=d, nlist=nlist, M=M, kmeans_iters=15, seed=42)
+            idx.train(xt)
+            del xt
+            for c in chunks():
+                idx.add(c)
+            print(f"  train+add: {time.perf_counter() - t0:.1f}s", flush=True)
+            settle()
+            for nprobe in NPROBE_GRID:
+                qps, lbl = time_qps(lambda q: idx.search(q, k=10, nprobe=nprobe), xq)
+                r = recall_at_k(lbl, gt, k=10)
+                print(f"  {name} nprobe={nprobe:<3}  recall={r:.3f}  qps={qps:.0f}", flush=True)
+                pts.append((r, qps))
+        else:
+            quantizer = faiss.IndexFlatL2(d)
+            idx = faiss.IndexIVFPQ(quantizer, d, nlist, M, 8)
+            idx.train(xt)
+            del xt
+            for c in chunks():
+                idx.add(c)
+            print(f"  train+add: {time.perf_counter() - t0:.1f}s", flush=True)
+            settle()
+            for nprobe in NPROBE_GRID:
+                idx.nprobe = nprobe
+                qps, _ = time_qps(lambda q: idx.search(q, 10), xq)
+                _, lbl = idx.search(xq, 10)
+                r = recall_at_k(lbl, gt, k=10)
+                print(f"  {name} nprobe={nprobe:<3}  recall={r:.3f}  qps={qps:.0f}", flush=True)
+                pts.append((r, qps))
+    else:
+        raise SystemExit(f"unknown series: {name}")
+
     return pts
 
 
-def sweep_faiss_hnsw(xb, xq, gt, ef_search_grid: Iterable[int]):
-    if not HAVE_FAISS: return []
-    d = xb.shape[1]
-    print("building faiss-HNSW...", flush=True)
-    idx = faiss.IndexHNSWFlat(d, 16)
-    idx.hnsw.efConstruction = 200
-    idx.add(xb)
-    pts = []
-    for ef in ef_search_grid:
-        idx.hnsw.efSearch = ef
-        qps, _ = time_qps(lambda q: idx.search(q, 10), xq)
-        _, lbl = idx.search(xq, 10)
-        r = recall_at_k(lbl, gt, k=10)
-        print(f"  faiss-HNSW efS={ef:<3}  recall={r:.3f}  qps={qps:.0f}", flush=True)
-        pts.append((r, qps))
-    return pts
+def merge_into_json(dataset: str, name: str, pts: list[tuple[float, float]]) -> None:
+    out_json = ROOT / "benchmarks" / f"results_{dataset}.json"
+    series = json.loads(out_json.read_text()) if out_json.exists() else {}
+    series[name] = pts
+    out_json.write_text(json.dumps(series, indent=2))
+    print(f"merged {name} -> {out_json}", flush=True)
 
 
-def sweep_ours_ivfpq(xb, xq, gt, M: int, nprobe_grid: Iterable[int]):
-    d = xb.shape[1]
-    nlist = max(64, min(1024, int(np.sqrt(len(xb)))))
-    print(f"building ours-IVFPQ(M={M})...", flush=True)
-    idx = IvfPqIndex(dim=d, nlist=nlist, M=M, kmeans_iters=15, seed=42)
-    n_train = min(len(xb), max(30 * nlist, 10_000))
-    idx.train(xb[:n_train])
-    idx.add(xb)
-    pts = []
-    for nprobe in nprobe_grid:
-        qps, lbl = time_qps(lambda q: idx.search(q, k=10, nprobe=nprobe), xq)
-        r = recall_at_k(lbl, gt, k=10)
-        print(f"  ours-IVFPQ M={M} nprobe={nprobe:<3}  recall={r:.3f}  qps={qps:.0f}", flush=True)
-        pts.append((r, qps))
-    return pts
+# ---- plotting ---------------------------------------------------------------
 
-
-def sweep_faiss_ivfpq(xb, xq, gt, M: int, nprobe_grid: Iterable[int]):
-    if not HAVE_FAISS: return []
-    d = xb.shape[1]
-    nlist = max(64, min(1024, int(np.sqrt(len(xb)))))
-    print(f"building faiss-IVFPQ(M={M})...", flush=True)
-    quantizer = faiss.IndexFlatL2(d)
-    idx = faiss.IndexIVFPQ(quantizer, d, nlist, M, 8)
-    n_train = min(len(xb), max(30 * nlist, 10_000))
-    idx.train(xb[:n_train])
-    idx.add(xb)
-    pts = []
-    for nprobe in nprobe_grid:
-        idx.nprobe = nprobe
-        qps, _ = time_qps(lambda q: idx.search(q, 10), xq)
-        _, lbl = idx.search(xq, 10)
-        r = recall_at_k(lbl, gt, k=10)
-        print(f"  faiss-IVFPQ M={M} nprobe={nprobe:<3}  recall={r:.3f}  qps={qps:.0f}", flush=True)
-        pts.append((r, qps))
-    return pts
-
-
-def main() -> None:
-    import argparse
+def plot(dataset: str) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    p = argparse.ArgumentParser()
-    p.add_argument("--dataset", choices=("sift1m", "gist1m"), default="sift1m")
-    args = p.parse_args()
-
-    if args.dataset == "sift1m":
-        xb, xq, gt = load_sift1m()
-        title_dataset = "SIFT1M (1M × 128)"
-    else:
-        xb, xq, gt = load_gist1m()
-        title_dataset = "GIST1M (1M × 960)"
-    print(f"{args.dataset}: base={xb.shape}  queries={xq.shape}", flush=True)
-
-    ef_grid = [16, 32, 64, 128, 256]
-    nprobe_grid = [1, 4, 8, 16, 32, 64]
-
-    series = {
-        "ours-HNSW":         sweep_ours_hnsw(xb, xq, gt, ef_grid),
-        "faiss-HNSW":        sweep_faiss_hnsw(xb, xq, gt, ef_grid),
-        "ours-IVFPQ(M=8)":   sweep_ours_ivfpq(xb, xq, gt, 8,  nprobe_grid),
-        "faiss-IVFPQ(M=8)":  sweep_faiss_ivfpq(xb, xq, gt, 8,  nprobe_grid),
-        "ours-IVFPQ(M=16)":  sweep_ours_ivfpq(xb, xq, gt, 16, nprobe_grid),
-        "faiss-IVFPQ(M=16)": sweep_faiss_ivfpq(xb, xq, gt, 16, nprobe_grid),
-    }
-
-    out_path = ROOT / "benchmarks" / f"results_{args.dataset}.png"
-    out_json = ROOT / "benchmarks" / f"results_{args.dataset}.json"
-    out_json.write_text(json.dumps(series, indent=2))
+    _, _, title_dataset = DATASETS[dataset]
+    out_json = ROOT / "benchmarks" / f"results_{dataset}.json"
+    out_path = ROOT / "benchmarks" / f"results_{dataset}.png"
+    series = json.loads(out_json.read_text())
 
     fig, ax = plt.subplots(figsize=(8, 6))
     style = {
@@ -164,8 +227,10 @@ def main() -> None:
         "ours-IVFPQ(M=16)":  dict(marker="^", linestyle="-",  color="C2"),
         "faiss-IVFPQ(M=16)": dict(marker="^", linestyle="--", color="C2", alpha=0.6),
     }
-    for name, pts in series.items():
-        if not pts: continue
+    for name in SERIES:
+        pts = series.get(name)
+        if not pts:
+            continue
         recalls = [p[0] for p in pts]
         qps     = [p[1] for p in pts]
         ax.plot(recalls, qps, label=name, **style.get(name, {}))
@@ -178,8 +243,39 @@ def main() -> None:
     ax.legend(loc="lower left", fontsize=9)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
-    print(f"\nwrote {out_path}")
-    print(f"wrote {out_json}")
+    print(f"wrote {out_path}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--dataset", choices=tuple(DATASETS), default="sift1m")
+    p.add_argument("--series", choices=SERIES, default=None,
+                   help="run ONE sweep in this process and merge into the JSON")
+    p.add_argument("--plot-only", action="store_true",
+                   help="render the PNG from the existing JSON")
+    args = p.parse_args()
+
+    if args.plot_only:
+        plot(args.dataset)
+        return
+
+    if args.series:
+        pts = run_series(args.dataset, args.series)
+        merge_into_json(args.dataset, args.series, pts)
+        return
+
+    # Orchestrator: one subprocess per series so memory is returned to the
+    # OS between sweeps, then render.
+    for name in SERIES:
+        if name.startswith("faiss") and not HAVE_FAISS:
+            print(f"skipping {name} (faiss not installed)", flush=True)
+            continue
+        subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()),
+             "--dataset", args.dataset, "--series", name],
+            check=True,
+        )
+    plot(args.dataset)
 
 
 if __name__ == "__main__":

@@ -20,14 +20,53 @@ SIFT1M_URL = "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz"  # 161 MB
 DEFAULT_DIR = Path.home() / "vectordb" / "data" / "sift"
 
 
-def fvecs_read(path: str | Path) -> np.ndarray:
-    a = np.fromfile(str(path), dtype="int32")
-    if a.size == 0:
+def _fvecs_mm(path: str | Path) -> np.ndarray:
+    """Memmap an .fvecs file as an (n, d+1) int32 view (col 0 = dim)."""
+    mm = np.memmap(str(path), dtype=np.int32, mode="r")
+    if mm.size == 0:
+        return mm.reshape(0, 1)
+    d = int(mm[0])
+    return mm.reshape(-1, d + 1)
+
+
+def fvecs_shape(path: str | Path) -> tuple[int, int]:
+    mm = _fvecs_mm(path)
+    return mm.shape[0], mm.shape[1] - 1
+
+
+def fvecs_read(path: str | Path, lo: int = 0, hi: int | None = None) -> np.ndarray:
+    """Read rows [lo, hi) of an .fvecs file as float32.
+
+    Memmap + chunked column-strip: the old np.fromfile + .copy() version
+    held BOTH the raw int32 array and the stripped copy at peak — 7.7 GB
+    transient for GIST1M, which alone could push a 16 GB machine into swap.
+    This version peaks at the output array + one ~128 MB chunk.
+    """
+    mm = _fvecs_mm(path)
+    n, d = mm.shape[0], mm.shape[1] - 1
+    if n == 0:
         return np.zeros((0, 0), dtype=np.float32)
-    d = int(a[0])
-    # Each record is (1 + d) int32s; reinterpret payload as float32.
-    a = a.reshape(-1, d + 1)[:, 1:]
-    return a.copy().view(np.float32)
+    if hi is None:
+        hi = n
+    out = np.empty((hi - lo, d), dtype=np.float32)
+    step = max(1, (1 << 25) // max(d + 1, 1))   # ~128 MB of int32 per chunk
+    for c in range(lo, hi, step):
+        e = min(hi, c + step)
+        # int32 payload copy -> reinterpret the bits as float32.
+        out[c - lo:e - lo] = mm[c:e, 1:].copy().view(np.float32)
+    return out
+
+
+def fvecs_chunks(path: str | Path, chunk_rows: int = 100_000):
+    """Yield contiguous float32 row-chunks of an .fvecs file.
+
+    Lets index builds stream the base vectors instead of materializing the
+    whole matrix next to the index's own internal copy."""
+    mm = _fvecs_mm(path)
+    n = mm.shape[0]
+    for lo in range(0, n, chunk_rows):
+        hi = min(n, lo + chunk_rows)
+        yield mm[lo:hi, 1:].copy().view(np.float32)
 
 
 def ivecs_read(path: str | Path) -> np.ndarray:

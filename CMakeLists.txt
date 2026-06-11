@@ -9,9 +9,14 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# Aggressive optimization. -ffast-math is OK here: distance kernels
-# do simple FMAs over float32, and we don't depend on NaN/Inf semantics.
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -ffast-math -funroll-loops -fno-omit-frame-pointer")
+# -O3 without -ffast-math, deliberately. fast-math licenses the compiler to
+# reassociate float math, which made l2sq() and l2sq_x4() round differently
+# for the SAME pair (~5% of pairs, few-ulp deltas) despite identical written
+# accumulation order. Mixed single/batched evaluations then made greedy
+# descent comparisons inconsistent and it cycled forever on GIST1M's
+# near-duplicate vectors. The hot kernels are hand-written NEON, so
+# fast-math bought nothing worth that.
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -funroll-loops -fno-omit-frame-pointer")
 
 # Apple Silicon already enables NEON; nothing to add. We detect via __ARM_NEON in code.
 # On x86 you'd want: -mavx2 -mfma (or -march=native).

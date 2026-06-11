@@ -447,6 +447,133 @@ def test_constructors_reject_bad_params(ctor):
         ctor()
 
 
+# ---- parallel / incremental build ----------------------------------------
+
+def test_hnsw_incremental_add_recall():
+    """Two add() batches (both above the parallel-build threshold) must yield
+    one coherent graph: recall over the combined set stays high."""
+    d = 32
+    a = gen_data(1500, d)
+    b = gen_data(1500, d)
+    both = np.vstack([a, b])
+    queries = gen_data(80, d)
+
+    flat = FlatIndex(dim=d, metric="l2")
+    flat.add(both)
+    _, truth = flat.search(queries, k=10)
+
+    idx = HnswIndex(dim=d, metric="l2", M=16, ef_construction=200, seed=3)
+    idx.add(a)
+    idx.add(b)
+    assert idx.size == 3000
+    _, pred = idx.search(queries, k=10, ef=64)
+    assert recall_at_k(pred, truth, k=10) >= 0.93
+
+
+def test_hnsw_streaming_small_adds():
+    """Many tiny add() calls take the serial insert path (below the parallel
+    threshold) and must keep entry-point/max-level bookkeeping intact."""
+    d = 16
+    data = gen_data(600, d)
+    queries = gen_data(40, d)
+
+    flat = FlatIndex(dim=d, metric="l2")
+    flat.add(data)
+    _, truth = flat.search(queries, k=5)
+
+    idx = HnswIndex(dim=d, metric="l2", M=16, ef_construction=100, seed=9)
+    for i in range(0, 600, 30):          # 20 batches of 30, all serial
+        idx.add(data[i:i + 30])
+    assert idx.size == 600
+    _, pred = idx.search(queries, k=5, ef=64)
+    assert recall_at_k(pred, truth, k=5) >= 0.93
+
+
+def test_flat_distances_exact_on_batch_tail():
+    """n=7 rows: one 4-wide batch + 3 single-pair tail rows. Distances from
+    both paths must agree with numpy — guards the batched-kernel tail."""
+    d = 24
+    data = gen_data(7, d)
+    queries = gen_data(3, d)
+    idx = FlatIndex(dim=d, metric="l2")
+    idx.add(data)
+    D, L = idx.search(queries, k=7)
+    for qi in range(3):
+        expected = np.sum((data - queries[qi]) ** 2, axis=1)
+        for j in range(7):
+            assert abs(D[qi, j] - expected[L[qi, j]]) < 1e-3
+
+
+def test_ivfpq_add_after_load_continues_labels(tmp_path):
+    """Labels are assigned from ntotal_; a loaded index must continue the
+    sequence instead of restarting at 0."""
+    d = 16
+    train = gen_data(400, d)
+    first = gen_data(30, d)
+    second = gen_data(20, d)
+
+    idx = IvfPqIndex(dim=d, nlist=4, M=4)
+    idx.train(train)
+    idx.add(first)
+
+    p = str(tmp_path / "ivf.bin")
+    idx.save(p)
+    loaded = IvfPqIndex.load(p)
+    loaded.add(second)
+    assert loaded.size == 50
+
+    _, L = loaded.search(second, k=1, nprobe=4)
+    # New vectors should mostly resolve to the new label range [30, 50).
+    assert L.max() < 50
+    assert (L >= 30).sum() >= 15
+
+
+def _build_duplicate_heavy(q):
+    """Child-process worker for test_hnsw_duplicate_heavy_build_terminates."""
+    import numpy as np
+    from vectordb import HnswIndex
+
+    rng = np.random.default_rng(0)
+    base = rng.standard_normal((2000, 64), dtype=np.float32)
+    # ~30% exact duplicates + a block of all-zero rows: lots of distance
+    # ties, the profile that triggered the GIST1M hang.
+    dup_idx = rng.integers(0, len(base), size=900)
+    data = np.vstack([base, base[dup_idx], np.zeros((100, 64), np.float32)])
+    rng.shuffle(data)
+
+    idx = HnswIndex(dim=64, M=16, ef_construction=200, seed=5)
+    idx.add(data)          # parallel build (above threshold)
+    _, L = idx.search(data[:20], k=3, ef=32)
+    q.put(int((L >= 0).all()))
+
+
+def test_hnsw_duplicate_heavy_build_terminates():
+    """Regression: greedy descent must terminate on tie/duplicate-heavy data.
+
+    Under -ffast-math the single-pair and batched distance kernels rounded
+    differently (few-ulp deltas on ~5% of pairs); greedy descent compared a
+    recomputed single-kernel `best` against batched-kernel neighbors and
+    could ping-pong forever between near-tied nodes. GIST1M (~1% duplicate
+    descriptors) hung inside its first 100k batch. Fixed by carrying `best`
+    (strictly decreasing scalar -> unconditional termination) and dropping
+    -ffast-math (kernels bit-identical again). Run in a child process with a
+    hard deadline so a regression fails the suite instead of hanging it.
+    """
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    qout = ctx.Queue()
+    p = ctx.Process(target=_build_duplicate_heavy, args=(qout,))
+    p.start()
+    p.join(timeout=120)
+    if p.is_alive():
+        p.terminate()
+        p.join()
+        pytest.fail("duplicate-heavy parallel build did not terminate in 120s")
+    assert p.exitcode == 0
+    assert qout.get() == 1
+
+
 # ---- multithread safety -------------------------------------------------
 
 def test_concurrent_search_threadsafe():

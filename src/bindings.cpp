@@ -68,6 +68,9 @@ PYBIND11_MODULE(_vectordb, m) {
              py::arg("data"))
         .def("search", &py_search<FlatIndex>,
              py::arg("queries"), py::arg("k"))
+        .def("reserve", &FlatIndex::reserve, py::arg("n"),
+             "Pre-size storage for n total vectors (avoids 2x realloc peaks "
+             "when streaming chunked add() calls).")
         .def("save", &FlatIndex::save, py::arg("path"))
         .def_static("load", &FlatIndex::load, py::arg("path"))
         .def_property_readonly("size", &FlatIndex::size)
@@ -110,6 +113,9 @@ PYBIND11_MODULE(_vectordb, m) {
                  return std::make_pair(dists, labels);
              },
              py::arg("queries"), py::arg("k"), py::arg("ef") = 64)
+        .def("reserve", &HnswIndex::reserve, py::arg("n"),
+             "Pre-size storage for n total vectors (avoids 2x realloc peaks "
+             "when streaming chunked add() calls).")
         .def("save", &HnswIndex::save, py::arg("path"))
         .def_static("load", &HnswIndex::load, py::arg("path"))
         .def_property_readonly("size", &HnswIndex::size)

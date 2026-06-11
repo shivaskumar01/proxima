@@ -90,6 +90,100 @@ float dot(const float* a, const float* b, std::size_t d) noexcept {
     return sum;
 }
 
+// ---- batch kernels --------------------------------------------------------
+//
+// 4 candidates x 4 accumulator chains = 16 live accumulators, plus 4 query
+// regs and a rotating candidate reg: ~21 of the 32 AArch64 NEON registers.
+// The query block is loaded ONCE per 16 elements and reused by all four
+// candidates (the single-pair kernel re-loads it per call).
+//
+// Per-candidate accumulation order mirrors l2sq()/dot() exactly:
+// 16-wide main loop into chains 0..3, 4-wide tail into chain 0, pairwise
+// horizontal sum, scalar tail. This keeps batched results bit-identical to
+// the single-pair kernels.
+
+void l2sq_x4(const float* q,
+             const float* p0, const float* p1,
+             const float* p2, const float* p3,
+             std::size_t d, float* out) noexcept {
+    const float* p[4] = {p0, p1, p2, p3};
+    float32x4_t acc[4][4];
+    for (int k = 0; k < 4; ++k)
+        for (int j = 0; j < 4; ++j) acc[k][j] = vdupq_n_f32(0.0f);
+
+    std::size_t i = 0;
+    for (; i + 16 <= d; i += 16) {
+        float32x4_t q0 = vld1q_f32(q + i);
+        float32x4_t q1 = vld1q_f32(q + i + 4);
+        float32x4_t q2 = vld1q_f32(q + i + 8);
+        float32x4_t q3 = vld1q_f32(q + i + 12);
+        for (int k = 0; k < 4; ++k) {
+            float32x4_t d0 = vsubq_f32(q0, vld1q_f32(p[k] + i));
+            float32x4_t d1 = vsubq_f32(q1, vld1q_f32(p[k] + i + 4));
+            float32x4_t d2 = vsubq_f32(q2, vld1q_f32(p[k] + i + 8));
+            float32x4_t d3 = vsubq_f32(q3, vld1q_f32(p[k] + i + 12));
+            acc[k][0] = vfmaq_f32(acc[k][0], d0, d0);
+            acc[k][1] = vfmaq_f32(acc[k][1], d1, d1);
+            acc[k][2] = vfmaq_f32(acc[k][2], d2, d2);
+            acc[k][3] = vfmaq_f32(acc[k][3], d3, d3);
+        }
+    }
+    for (; i + 4 <= d; i += 4) {
+        float32x4_t qv = vld1q_f32(q + i);
+        for (int k = 0; k < 4; ++k) {
+            float32x4_t df = vsubq_f32(qv, vld1q_f32(p[k] + i));
+            acc[k][0] = vfmaq_f32(acc[k][0], df, df);
+        }
+    }
+    for (int k = 0; k < 4; ++k) {
+        float32x4_t a = vaddq_f32(vaddq_f32(acc[k][0], acc[k][1]),
+                                  vaddq_f32(acc[k][2], acc[k][3]));
+        float sum = vaddvq_f32(a);
+        for (std::size_t t = i; t < d; ++t) {
+            float df = q[t] - p[k][t];
+            sum += df * df;
+        }
+        out[k] = sum;
+    }
+}
+
+void dot_x4(const float* q,
+            const float* p0, const float* p1,
+            const float* p2, const float* p3,
+            std::size_t d, float* out) noexcept {
+    const float* p[4] = {p0, p1, p2, p3};
+    float32x4_t acc[4][4];
+    for (int k = 0; k < 4; ++k)
+        for (int j = 0; j < 4; ++j) acc[k][j] = vdupq_n_f32(0.0f);
+
+    std::size_t i = 0;
+    for (; i + 16 <= d; i += 16) {
+        float32x4_t q0 = vld1q_f32(q + i);
+        float32x4_t q1 = vld1q_f32(q + i + 4);
+        float32x4_t q2 = vld1q_f32(q + i + 8);
+        float32x4_t q3 = vld1q_f32(q + i + 12);
+        for (int k = 0; k < 4; ++k) {
+            acc[k][0] = vfmaq_f32(acc[k][0], q0, vld1q_f32(p[k] + i));
+            acc[k][1] = vfmaq_f32(acc[k][1], q1, vld1q_f32(p[k] + i + 4));
+            acc[k][2] = vfmaq_f32(acc[k][2], q2, vld1q_f32(p[k] + i + 8));
+            acc[k][3] = vfmaq_f32(acc[k][3], q3, vld1q_f32(p[k] + i + 12));
+        }
+    }
+    for (; i + 4 <= d; i += 4) {
+        float32x4_t qv = vld1q_f32(q + i);
+        for (int k = 0; k < 4; ++k) {
+            acc[k][0] = vfmaq_f32(acc[k][0], qv, vld1q_f32(p[k] + i));
+        }
+    }
+    for (int k = 0; k < 4; ++k) {
+        float32x4_t a = vaddq_f32(vaddq_f32(acc[k][0], acc[k][1]),
+                                  vaddq_f32(acc[k][2], acc[k][3]));
+        float sum = vaddvq_f32(a);
+        for (std::size_t t = i; t < d; ++t) sum += q[t] * p[k][t];
+        out[k] = sum;
+    }
+}
+
 #else  // scalar fallback
 
 float l2sq(const float* a, const float* b, std::size_t d) noexcept {
@@ -121,6 +215,47 @@ float dot(const float* a, const float* b, std::size_t d) noexcept {
     return s;
 }
 
+// Scalar fallback: batched == four single calls (trivially bit-identical).
+void l2sq_x4(const float* q,
+             const float* p0, const float* p1,
+             const float* p2, const float* p3,
+             std::size_t d, float* out) noexcept {
+    out[0] = l2sq(q, p0, d);
+    out[1] = l2sq(q, p1, d);
+    out[2] = l2sq(q, p2, d);
+    out[3] = l2sq(q, p3, d);
+}
+
+void dot_x4(const float* q,
+            const float* p0, const float* p1,
+            const float* p2, const float* p3,
+            std::size_t d, float* out) noexcept {
+    out[0] = dot(q, p0, d);
+    out[1] = dot(q, p1, d);
+    out[2] = dot(q, p2, d);
+    out[3] = dot(q, p3, d);
+}
+
 #endif
+
+void l2sq_ny(float* out, const float* q, const float* base,
+             std::size_t ny, std::size_t d) noexcept {
+    std::size_t i = 0;
+    for (; i + 4 <= ny; i += 4) {
+        const float* row = base + i * d;
+        l2sq_x4(q, row, row + d, row + 2 * d, row + 3 * d, d, out + i);
+    }
+    for (; i < ny; ++i) out[i] = l2sq(q, base + i * d, d);
+}
+
+void dot_ny(float* out, const float* q, const float* base,
+            std::size_t ny, std::size_t d) noexcept {
+    std::size_t i = 0;
+    for (; i + 4 <= ny; i += 4) {
+        const float* row = base + i * d;
+        dot_x4(q, row, row + d, row + 2 * d, row + 3 * d, d, out + i);
+    }
+    for (; i < ny; ++i) out[i] = dot(q, base + i * d, d);
+}
 
 }  // namespace vectordb

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <string>
 #include <vector>
@@ -32,7 +33,16 @@ struct VisitedSet {
 };
 
 // HNSW (Hierarchical Navigable Small World) index following Malkov & Yashunin
-// 2016 (arXiv:1603.09320). Single-threaded build/search; correctness-first.
+// 2016 (arXiv:1603.09320).
+//
+// Concurrency model:
+//   - add() parallelizes insertion across the batch with hnswlib-style
+//     fine-grained locking: one mutex per node guarding its link lists, plus
+//     a global entry-point mutex. Levels are drawn serially from the seeded
+//     RNG before the parallel phase, so the level distribution is
+//     deterministic; the link structure depends on insertion interleaving.
+//   - search() on a quiescent index is lock-free and thread-safe (the
+//     existing guarantee). Concurrent add() + search() is NOT supported.
 //
 // Tunables:
 //   M               base connectivity per layer above 0 (typ. 8..32)
@@ -47,6 +57,16 @@ public:
               uint64_t seed = 42);
 
     void add(const float* data, std::size_t n);
+
+    // Pre-size storage for a total of n vectors. Essential when streaming
+    // chunked add() calls on large datasets: vector growth doubles capacity,
+    // so without an up-front reserve the data buffer transiently needs ~2x
+    // the final footprint during the last realloc.
+    void reserve(std::size_t n) {
+        data_.reserve(n * dim_);
+        level_.reserve(n);
+        links_.reserve(n);
+    }
 
     void search(const float* queries, std::size_t nq, std::size_t k,
                 std::size_t ef,
@@ -67,17 +87,43 @@ private:
     using DistFn = float (*)(const float*, const float*, std::size_t);
     using PairF  = std::pair<float, id_t>;   // (distance, node id)
 
+    // Per-thread traversal scratch: visited marks plus reusable buffers for
+    // (a) the unvisited-neighbor batch handed to the 4-wide distance kernel
+    // and (b) locked snapshots of a node's neighbor list during parallel
+    // build. Owned by the caller so a const HnswIndex can be searched from
+    // many threads at once.
+    struct SearchCtx {
+        VisitedSet visited;
+        std::vector<id_t> gather;
+        std::vector<id_t> snapshot;
+    };
+
     int    random_level();
     float  distance(const float* a, const float* b) const noexcept;
     const float* vec(id_t id) const noexcept { return data_.data() + id * dim_; }
 
-    // Search a single layer; returns up to ef closest nodes (unsorted vector
-    // representing a max-heap snapshot, caller may sort).
-    // Visited state is provided by the caller so multiple threads can share
-    // a const HnswIndex.
+    // One query against four node ids via the batched NEON kernel
+    // (bit-identical to four distance() calls).
+    void distance_x4_ids(const float* q, const id_t* ids,
+                         float* out) const noexcept;
+
+    // The kLocked variants of the traversal primitives take each node's
+    // mutex while reading/writing its link list; the lock-free variants
+    // (kLocked = false) are used by query-time search on a quiescent index
+    // and by small serial builds. `locks` may be null when !kLocked.
+
+    // Greedy steepest-descent through layers (from, to]: at each layer hop
+    // to the closest neighbor until a local minimum, then drop a layer.
+    template <bool kLocked>
+    id_t greedy_descend(const float* q, id_t curr, int from, int to,
+                        SearchCtx& ctx, std::mutex* locks) const;
+
+    // Beam search within one layer; returns up to ef closest nodes
+    // (unsorted max-heap snapshot, caller may sort).
+    template <bool kLocked>
     std::vector<PairF> search_layer(const float* q, id_t entry,
                                     std::size_t ef, int layer,
-                                    VisitedSet& vs) const;
+                                    SearchCtx& ctx, std::mutex* locks) const;
 
     // Heuristic neighbor selection (Algorithm 4 in the paper).
     // candidates is a list of (distance, id) pairs to consider; M is target.
@@ -86,7 +132,15 @@ private:
         const std::vector<PairF>& candidates,
         std::size_t M) const;
 
-    void connect(id_t new_id, const std::vector<PairF>& neighbors, int layer);
+    template <bool kLocked>
+    void connect(id_t new_id, const std::vector<PairF>& neighbors, int layer,
+                 std::mutex* locks);
+
+    // Insert one pre-allocated node (data_/level_/links_ slots must already
+    // exist). entry_mtx guards entry_point_/max_level_ when kLocked.
+    template <bool kLocked>
+    void insert_one(id_t id, SearchCtx& ctx,
+                    std::mutex* locks, std::mutex* entry_mtx);
 
     std::size_t dim_;
     Metric      metric_;

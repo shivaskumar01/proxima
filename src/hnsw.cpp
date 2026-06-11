@@ -7,11 +7,19 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <queue>
 #include <stdexcept>
 #include <utility>
 
 namespace vectordb {
+
+namespace {
+// Below this batch size a parallel build doesn't pay: thread spawn plus the
+// O(ntotal) mutex array would dominate. Keeps streaming one-at-a-time add()
+// calls on the cheap serial path.
+constexpr std::size_t kParallelBuildThreshold = 256;
+}  // namespace
 
 HnswIndex::HnswIndex(std::size_t dim, Metric metric,
                      std::size_t M, std::size_t ef_construction,
@@ -38,6 +46,19 @@ float HnswIndex::distance(const float* a, const float* b) const noexcept {
     return dist_fn_(a, b, dim_);
 }
 
+void HnswIndex::distance_x4_ids(const float* q, const id_t* ids,
+                                float* out) const noexcept {
+    if (metric_ == Metric::L2) {
+        l2sq_x4(q, vec(ids[0]), vec(ids[1]), vec(ids[2]), vec(ids[3]),
+                dim_, out);
+    } else {
+        dot_x4(q, vec(ids[0]), vec(ids[1]), vec(ids[2]), vec(ids[3]),
+               dim_, out);
+        out[0] = -out[0]; out[1] = -out[1];
+        out[2] = -out[2]; out[3] = -out[3];
+    }
+}
+
 int HnswIndex::random_level() {
     // Level ~ floor(-ln(U) / ln(M)). Geometric distribution; p(level >= l) = M^-l.
     std::uniform_real_distribution<double> u(0.0, 1.0);
@@ -46,12 +67,70 @@ int HnswIndex::random_level() {
     return static_cast<int>(std::floor(-std::log(r) * level_mult_));
 }
 
+template <bool kLocked>
+id_t HnswIndex::greedy_descend(const float* q, id_t curr, int from, int to,
+                               SearchCtx& ctx, std::mutex* locks) const {
+    if (from <= to) return curr;
+
+    // `best` is computed ONCE and only ever lowered by strict comparison.
+    // Termination therefore does not depend on distance evaluations being
+    // reproducible: each accepted hop strictly decreases a single scalar.
+    //
+    // The earlier version recomputed best = distance(q, vec(curr)) on every
+    // pass — with the single-pair kernel — while neighbors were evaluated
+    // with the batched kernel. Under -ffast-math those two kernels rounded
+    // differently (~5% of pairs, few-ulp deltas), and on near-tie pairs the
+    // inconsistent comparisons let greedy descent ping-pong A->B->A forever.
+    // GIST1M, with ~1% exact-duplicate descriptors, hit this within one
+    // 100k batch; SIFT1M never did in 1M inserts. Fixed both ways: this
+    // carried-best loop terminates under ANY kernel discrepancy, and
+    // -ffast-math is gone so the kernels are bit-identical again.
+    float best = distance(q, vec(curr));
+    float d4[4];
+    for (int lc = from; lc > to; --lc) {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            const std::vector<id_t>* nb;
+            if constexpr (kLocked) {
+                // Copy under the node's lock, then compute lock-free.
+                {
+                    std::lock_guard<std::mutex> g(locks[curr]);
+                    ctx.snapshot = links_[curr][lc];
+                }
+                nb = &ctx.snapshot;
+            } else {
+                nb = &links_[curr][lc];
+            }
+            const auto& nbrs = *nb;
+            std::size_t i = 0;
+            for (; i + 4 <= nbrs.size(); i += 4) {
+                distance_x4_ids(q, nbrs.data() + i, d4);
+                for (int j = 0; j < 4; ++j) {
+                    if (d4[j] < best) {
+                        best = d4[j];
+                        curr = nbrs[i + j];
+                        changed = true;
+                    }
+                }
+            }
+            for (; i < nbrs.size(); ++i) {
+                float d = distance(q, vec(nbrs[i]));
+                if (d < best) { best = d; curr = nbrs[i]; changed = true; }
+            }
+        }
+    }
+    return curr;
+}
+
+template <bool kLocked>
 std::vector<HnswIndex::PairF>
 HnswIndex::search_layer(const float* q, id_t entry,
                         std::size_t ef, int layer,
-                        VisitedSet& vs) const {
-    // Generation-counter visited tracking, owned by the caller so search() can
-    // run with one VisitedSet per std::thread worker (no shared mutable state).
+                        SearchCtx& ctx, std::mutex* locks) const {
+    // Generation-counter visited tracking, owned by the caller so search()
+    // can run with one SearchCtx per std::thread worker (no shared state).
+    VisitedSet& vs = ctx.visited;
     vs.resize_to(ntotal_);
     const uint32_t mark = vs.bump();
     auto& visited = vs.marks;
@@ -64,32 +143,54 @@ HnswIndex::search_layer(const float* q, id_t entry,
     top.emplace(d0, entry);
     visited[entry] = mark;
 
+    auto consider = [&](id_t e, float ed) {
+        if (top.size() < ef || ed < top.top().first) {
+            candidates.emplace(ed, e);
+            top.emplace(ed, e);
+            if (top.size() > ef) top.pop();
+        }
+    };
+
+    float d4[4];
     while (!candidates.empty()) {
         PairF cur = candidates.top();
         if (cur.first > top.top().first) break;
         candidates.pop();
 
-        const auto& nbrs = links_[cur.second][layer];
-
-        // Software prefetch: pull the first neighbor's vector into L1 ahead
-        // of the distance call. Each neighbor lookup is a random ~dim*4 byte
-        // load; prefetching one ahead hides the L1/L2 miss latency.
-        if (!nbrs.empty()) __builtin_prefetch(vec(nbrs[0]), 0, 1);
-
-        for (std::size_t i = 0; i < nbrs.size(); ++i) {
-            id_t e = nbrs[i];
-            if (i + 1 < nbrs.size()) {
-                __builtin_prefetch(vec(nbrs[i + 1]), 0, 1);
+        const std::vector<id_t>* nb;
+        if constexpr (kLocked) {
+            {
+                std::lock_guard<std::mutex> g(locks[cur.second]);
+                ctx.snapshot = links_[cur.second][layer];
             }
+            nb = &ctx.snapshot;
+        } else {
+            nb = &links_[cur.second][layer];
+        }
+
+        // Gather the unvisited neighbors (marking as we go) and prefetch
+        // their vectors — each is a random ~dim*4-byte load — then compute
+        // distances four at a time. Same neighbor order as a one-by-one
+        // scan, so heap contents are identical.
+        auto& batch = ctx.gather;
+        batch.clear();
+        for (id_t e : *nb) {
             if (visited[e] == mark) continue;
             visited[e] = mark;
+            __builtin_prefetch(vec(e), 0, 1);
+            batch.push_back(e);
+        }
 
-            float ed = distance(q, vec(e));
-            if (top.size() < ef || ed < top.top().first) {
-                candidates.emplace(ed, e);
-                top.emplace(ed, e);
-                if (top.size() > ef) top.pop();
-            }
+        std::size_t i = 0;
+        for (; i + 4 <= batch.size(); i += 4) {
+            distance_x4_ids(q, batch.data() + i, d4);
+            consider(batch[i],     d4[0]);
+            consider(batch[i + 1], d4[1]);
+            consider(batch[i + 2], d4[2]);
+            consider(batch[i + 3], d4[3]);
+        }
+        for (; i < batch.size(); ++i) {
+            consider(batch[i], distance(q, vec(batch[i])));
         }
     }
 
@@ -127,16 +228,37 @@ HnswIndex::select_neighbors_heuristic(const float* q,
     return R;
 }
 
-void HnswIndex::connect(id_t new_id, const std::vector<PairF>& neighbors, int layer) {
-    auto& my_links = links_[new_id][layer];
-    my_links.clear();
-    my_links.reserve(neighbors.size());
-    for (const PairF& p : neighbors) my_links.push_back(p.second);
+template <bool kLocked>
+void HnswIndex::connect(id_t new_id, const std::vector<PairF>& neighbors,
+                        int layer, std::mutex* locks) {
+    {
+        std::unique_lock<std::mutex> g;
+        if constexpr (kLocked) g = std::unique_lock<std::mutex>(locks[new_id]);
+        // Merge rather than overwrite: during a parallel build another
+        // thread may have already pushed a backlink into new_id's list at
+        // this layer; clobbering it would leave a one-directional edge.
+        auto& my_links = links_[new_id][layer];
+        for (const PairF& p : neighbors) {
+            id_t nid = p.second;
+            if (std::find(my_links.begin(), my_links.end(), nid) ==
+                my_links.end()) {
+                my_links.push_back(nid);
+            }
+        }
+    }
 
     const std::size_t cap = (layer == 0) ? M_max0_ : M_max_;
     for (const PairF& p : neighbors) {
         id_t n = p.second;
+        std::unique_lock<std::mutex> g;
+        if constexpr (kLocked) g = std::unique_lock<std::mutex>(locks[n]);
         auto& their_links = links_[n][layer];
+        // Dedupe: under a parallel build, n (itself mid-insert) may already
+        // have merged new_id into its list via its own connect().
+        if (std::find(their_links.begin(), their_links.end(), new_id) !=
+            their_links.end()) {
+            continue;
+        }
         their_links.push_back(new_id);
         if (their_links.size() > cap) {
             // Re-prune via heuristic so the existing node keeps its best edges.
@@ -153,61 +275,112 @@ void HnswIndex::connect(id_t new_id, const std::vector<PairF>& neighbors, int la
     }
 }
 
-void HnswIndex::add(const float* data_in, std::size_t n) {
-    // Build is single-threaded; one VisitedSet for the whole batch.
-    VisitedSet vs;
-    for (std::size_t k = 0; k < n; ++k) {
-        const float* v = data_in + k * dim_;
-        id_t id = static_cast<id_t>(ntotal_);
-        ntotal_++;
+template <bool kLocked>
+void HnswIndex::insert_one(id_t id, SearchCtx& ctx,
+                           std::mutex* locks, std::mutex* entry_mtx) {
+    const float* v = vec(id);
+    const int new_level = level_[id];
 
-        data_.insert(data_.end(), v, v + dim_);
-        int new_level = random_level();
-        level_.push_back(new_level);
-        links_.emplace_back();
-        links_[id].resize(new_level + 1);
+    // Snapshot the entry point. A node whose level exceeds the current max
+    // holds the entry lock for its whole insertion (it will become the new
+    // entry point, and two max-raising inserts must serialize). This happens
+    // ~log_M(n) times per build, so the serialization is negligible.
+    std::unique_lock<std::mutex> entry_lock;
+    if constexpr (kLocked) {
+        entry_lock = std::unique_lock<std::mutex>(*entry_mtx);
+    }
+    id_t curr     = entry_point_;
+    int  snap_max = max_level_;
+    [[maybe_unused]] const bool hold = kLocked && new_level > snap_max;
+    if constexpr (kLocked) {
+        if (!hold) entry_lock.unlock();
+    }
 
-        if (id == 0) {
-            entry_point_ = 0;
-            max_level_   = new_level;
-            continue;
+    // Greedy descent through layers strictly above new_level.
+    curr = greedy_descend<kLocked>(v, curr, snap_max, new_level, ctx, locks);
+
+    // Beam search + connect for layers min(max_level, new_level) down to 0.
+    for (int lc = std::min(snap_max, new_level); lc >= 0; --lc) {
+        auto W = search_layer<kLocked>(v, curr, ef_construction_, lc, ctx, locks);
+        auto neighbors = select_neighbors_heuristic(v, W, M_);
+        connect<kLocked>(id, neighbors, lc, locks);
+
+        // Hand off to next layer's greedy entry: nearest of the candidates.
+        if (!W.empty()) {
+            auto it = std::min_element(W.begin(), W.end(),
+                [](const PairF& a, const PairF& b) { return a.first < b.first; });
+            curr = it->second;
         }
+    }
 
-        id_t curr = entry_point_;
-
-        // Greedy descent through layers strictly above new_level.
-        for (int lc = max_level_; lc > new_level; --lc) {
-            bool changed = true;
-            while (changed) {
-                changed = false;
-                const auto& nbrs = links_[curr][lc];
-                float best = distance(v, vec(curr));
-                for (id_t e : nbrs) {
-                    float d = distance(v, vec(e));
-                    if (d < best) { best = d; curr = e; changed = true; }
-                }
+    if (new_level > snap_max) {
+        if constexpr (kLocked) {
+            // `hold` inserts still own the lock; re-check under it either way
+            // (another thread may have raised max_level_ past us meanwhile).
+            if (!hold) entry_lock.lock();
+            if (new_level > max_level_) {
+                max_level_   = new_level;
+                entry_point_ = id;
             }
-        }
-
-        // Beam search + connect for layers min(max_level, new_level) down to 0.
-        for (int lc = std::min(max_level_, new_level); lc >= 0; --lc) {
-            auto W = search_layer(v, curr, ef_construction_, lc, vs);
-            auto neighbors = select_neighbors_heuristic(v, W, M_);
-            connect(id, neighbors, lc);
-
-            // Hand off to next layer's greedy entry: nearest of the candidates.
-            if (!W.empty()) {
-                auto it = std::min_element(W.begin(), W.end(),
-                    [](const PairF& a, const PairF& b) { return a.first < b.first; });
-                curr = it->second;
-            }
-        }
-
-        if (new_level > max_level_) {
+        } else {
             max_level_   = new_level;
             entry_point_ = id;
         }
     }
+}
+
+void HnswIndex::add(const float* data_in, std::size_t n) {
+    if (n == 0) return;
+    const std::size_t start = ntotal_;
+
+    // ---- Serial pre-phase: reserve every slot the parallel phase touches.
+    // Vectors and levels are appended up front so data_ never reallocates
+    // (and vec() stays valid) while worker threads run. Levels are drawn
+    // serially so the rng_ sequence — and the level distribution — is
+    // deterministic regardless of thread count.
+    data_.insert(data_.end(), data_in, data_in + n * dim_);
+    level_.reserve(start + n);
+    links_.reserve(start + n);
+    for (std::size_t k = 0; k < n; ++k) {
+        int lv = random_level();
+        level_.push_back(lv);
+        links_.emplace_back();
+        links_[start + k].resize(lv + 1);
+    }
+    ntotal_ = start + n;
+
+    std::size_t first = 0;
+    if (start == 0) {
+        // Bootstrap: node 0 is the initial entry point, trivially inserted.
+        entry_point_ = 0;
+        max_level_   = level_[0];
+        first = 1;
+    }
+    const std::size_t m = n - first;
+    if (m == 0) return;
+
+    if (m < kParallelBuildThreshold || default_num_threads() <= 1) {
+        SearchCtx ctx;
+        for (std::size_t k = 0; k < m; ++k) {
+            insert_one<false>(static_cast<id_t>(start + first + k),
+                              ctx, nullptr, nullptr);
+        }
+        return;
+    }
+
+    // ---- Parallel phase: hnswlib-style fine-grained locking. One mutex per
+    // node guards that node's link lists; entry_mtx guards entry_point_ and
+    // max_level_. data_/level_ are read-only here. Lock order is one node
+    // lock at a time, with entry_mtx never acquired while holding a node
+    // lock — no cycles, no deadlock.
+    std::vector<std::mutex> locks(ntotal_);
+    std::mutex entry_mtx;
+    parallel_for<SearchCtx>(m,
+        []() { return SearchCtx{}; },
+        [&](std::size_t k, SearchCtx& ctx) {
+            insert_one<true>(static_cast<id_t>(start + first + k),
+                             ctx, locks.data(), &entry_mtx);
+        });
 }
 
 void HnswIndex::search(const float* queries, std::size_t nq, std::size_t k,
@@ -225,29 +398,18 @@ void HnswIndex::search(const float* queries, std::size_t nq, std::size_t k,
 
     const bool is_l2 = (metric_ == Metric::L2);
 
-    // Each query is independent. Per-thread state is just a VisitedSet; the
-    // HnswIndex itself is read-only here. parallel_for builds one ctx per
-    // worker thread before dispatching this thread's slice of queries.
-    parallel_for<VisitedSet>(nq,
-        []() { return VisitedSet{}; },
-        [&](std::size_t qi, VisitedSet& vs) {
+    // Each query is independent and the index is read-only here, so the
+    // traversal runs lock-free. parallel_for builds one SearchCtx per worker
+    // thread before dispatching this thread's slice of queries.
+    parallel_for<SearchCtx>(nq,
+        []() { return SearchCtx{}; },
+        [&](std::size_t qi, SearchCtx& ctx) {
             const float* q = queries + qi * dim_;
-            id_t curr = entry_point_;
 
-            for (int lc = max_level_; lc >= 1; --lc) {
-                bool changed = true;
-                while (changed) {
-                    changed = false;
-                    const auto& nbrs = links_[curr][lc];
-                    float best = distance(q, vec(curr));
-                    for (id_t e : nbrs) {
-                        float d = distance(q, vec(e));
-                        if (d < best) { best = d; curr = e; changed = true; }
-                    }
-                }
-            }
+            id_t curr = greedy_descend<false>(q, entry_point_, max_level_, 0,
+                                              ctx, nullptr);
 
-            auto W = search_layer(q, curr, ef, 0, vs);
+            auto W = search_layer<false>(q, curr, ef, 0, ctx, nullptr);
             std::sort(W.begin(), W.end(),
                       [](const PairF& a, const PairF& b) { return a.first < b.first; });
 
