@@ -10,9 +10,7 @@
 #include <queue>
 #include <stdexcept>
 
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
+#include "vectordb/simd.hpp"
 
 namespace vectordb {
 
@@ -316,7 +314,7 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
             const float* cb_T_m = pq_codebooks_T_.data() + m * dsub_ * KSUB;
             float*       qd_m   = qdot.data() + m * KSUB;
 
-#if defined(__ARM_NEON)
+#if VECTORDB_USE_NEON
             for (std::size_t k_start = 0; k_start < KSUB; k_start += 16) {
                 float32x4_t a0 = vdupq_n_f32(0.0f);
                 float32x4_t a1 = vdupq_n_f32(0.0f);
@@ -372,7 +370,7 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
                 static_cast<std::size_t>(c) * M_ * KSUB;
             const float  bias = coarse_d[c];
             const std::size_t total = M_ * KSUB;
-#if defined(__ARM_NEON)
+#if VECTORDB_USE_NEON
             for (std::size_t i = 0; i < total; i += 16) {
                 vst1q_f32(lut.data() + i,
                           vaddq_f32(vld1q_f32(pc + i), vld1q_f32(qdot.data() + i)));

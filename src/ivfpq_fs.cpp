@@ -10,9 +10,7 @@
 #include <queue>
 #include <stdexcept>
 
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
+#include "vectordb/simd.hpp"
 
 namespace vectordb {
 
@@ -292,7 +290,7 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
             const float* q_m    = q + m * dsub_;
             const float* cb_T_m = pq_codebooks_T_.data() + m * dsub_ * KSUB;
             float*       qd_m   = ctx.qdot.data() + m * KSUB;
-#if defined(__ARM_NEON)
+#if VECTORDB_USE_NEON
             float32x4_t a0 = vdupq_n_f32(0.0f);
             float32x4_t a1 = vdupq_n_f32(0.0f);
             float32x4_t a2 = vdupq_n_f32(0.0f);
@@ -399,13 +397,15 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
                 return static_cast<uint32_t>(t);
             };
 
-            uint32_t thr = qthresh();
+#if VECTORDB_USE_NEON
+            uint32_t thr = qthresh();   // scalar path scans exactly, no filter
+#endif
             const std::size_t bb = block_bytes();
             const std::size_t nblocks = (n_c + BLOCK - 1) / BLOCK;
             for (std::size_t b = 0; b < nblocks; ++b) {
                 const uint8_t* bp = packed_c.data() + b * bb;
                 const std::size_t lanes = std::min(BLOCK, n_c - b * BLOCK);
-#if defined(__ARM_NEON)
+#if VECTORDB_USE_NEON
                 // 5. The fast scan: per subspace pair, one load + two tbl
                 //    lookups score 16 candidates; u16 lanes accumulate.
                 __builtin_prefetch(bp + bb, 0, 0);   // next block's codes

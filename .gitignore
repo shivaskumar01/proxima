@@ -11,3 +11,4 @@ data/
 *.ivecs
 benchmarks/results_*.json
 *.zip
+build-scalar/

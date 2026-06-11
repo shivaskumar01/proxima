@@ -59,3 +59,11 @@ target_include_directories(_vectordb PRIVATE include)
 set_target_properties(_vectordb PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/python/vectordb
 )
+
+# Compile the scalar fallback paths even on ARM (CI runs both flavors; the
+# fallbacks otherwise never get built on Apple Silicon dev machines).
+option(VECTORDB_FORCE_SCALAR "Disable NEON paths, build scalar fallbacks" OFF)
+if(VECTORDB_FORCE_SCALAR)
+  target_compile_definitions(vectordb_core PUBLIC VECTORDB_FORCE_SCALAR)
+  target_compile_definitions(_vectordb PRIVATE VECTORDB_FORCE_SCALAR)
+endif()

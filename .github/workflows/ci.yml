@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon runner: the NEON fast paths.
+          - { os: macos-14, scalar: "OFF", name: macos-neon }
+          # Same hardware, scalar fallbacks forced on: catches bit-rot in
+          # the #else branches that dev machines never compile.
+          - { os: macos-14, scalar: "ON", name: macos-scalar }
+          # x86 Linux: scalar by default, plus a second toolchain/platform.
+          - { os: ubuntu-latest, scalar: "OFF", name: linux-scalar }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python deps
+        run: python -m pip install numpy pybind11 pytest
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DPython3_EXECUTABLE=$(which python)
+          -DVECTORDB_FORCE_SCALAR=${{ matrix.scalar }}
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: python -m pytest tests/ -v

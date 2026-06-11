@@ -1,11 +1,7 @@
 #include "vectordb/distance.hpp"
 
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#define VECTORDB_HAS_NEON 1
-#else
-#define VECTORDB_HAS_NEON 0
-#endif
+#include "vectordb/simd.hpp"
+#define VECTORDB_HAS_NEON VECTORDB_USE_NEON
 
 namespace vectordb {
 
