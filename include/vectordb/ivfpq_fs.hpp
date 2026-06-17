@@ -10,7 +10,7 @@
 namespace vectordb {
 
 // IVF-PQ "fast scan": 4-bit product quantization scanned with the NEON
-// `tbl` instruction — the design FAISS ships as IndexIVFPQFastScan.
+// `tbl` instruction, the design FAISS ships as IndexIVFPQFastScan.
 //
 // Versus the 8-bit IvfPqIndex:
 //   - KSUB = 16 codebook entries per subspace (codes are 4 bits), so at the
@@ -24,7 +24,7 @@ namespace vectordb {
 //     of the exact ADC distance. The SIMD scan therefore acts as a lossless
 //     filter: only lanes whose underestimate beats the current top-k get
 //     re-scored exactly against the float LUT, so results are exact ADC
-//     top-k — quantization never costs recall.
+//     top-k, quantization never costs recall.
 //
 // Shares the precomputed-table ADC expansion with IvfPqIndex for L2; for
 // InnerProduct (raw-vector encoding, FAISS-style) the dot table is

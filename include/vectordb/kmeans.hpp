@@ -16,7 +16,7 @@ namespace vectordb {
 // out_assign: optional, resized to n, filled with cluster id per point
 // nthreads:   0 = all cores. The parallel parts (assignment, seeding-distance
 //             updates) are per-point independent, so results are identical
-//             for any thread count — determinism depends only on `seed`.
+//             for any thread count, determinism depends only on `seed`.
 //             Pass 1 when calling from an already-parallel context (e.g. the
 //             per-subspace PQ training loop) to avoid oversubscription.
 void kmeans(const float* data, std::size_t n, std::size_t dim,

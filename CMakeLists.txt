@@ -22,7 +22,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -funroll-loops -fno-omit-frame-pointer
 # On x86 you'd want: -mavx2 -mfma (or -march=native).
 
 # We use std::thread for parallelism (not OpenMP) to avoid the well-known
-# macOS dyld error when two libomp copies are loaded — faiss-cpu bundles its
+# macOS dyld error when two libomp copies are loaded, faiss-cpu bundles its
 # own and would conflict with Homebrew's. std::thread needs no extra deps.
 find_package(Threads REQUIRED)
 
@@ -62,7 +62,7 @@ endif()
 # index through add / remove_ids / re-add / search / save-load on both
 # metrics with adversarial sizes. Builds the core + harness with ASan so CI
 # catches the OOB/use-after-free class on every push (the v5 segfault would
-# have tripped this). In this mode the pybind module is skipped — the job
+# have tripped this). In this mode the pybind module is skipped, the job
 # only runs the harness.
 option(VECTORDB_ASAN "Build the ASan smoke-test executable instead of the module" OFF)
 if(VECTORDB_ASAN)

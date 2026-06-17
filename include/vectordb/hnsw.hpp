@@ -73,7 +73,7 @@ public:
                 float* out_distances, label_t* out_labels) const;
 
     // Tombstone deletion (hnswlib-style mark_deleted): nodes stay in the
-    // graph as routing waypoints — removing edges would shred connectivity —
+    // graph as routing waypoints, removing edges would shred connectivity, 
     // but never appear in results. Memory is not reclaimed; labels (= node
     // ids) stay stable. Returns the number newly marked.
     std::size_t remove_ids(const label_t* labels, std::size_t n);

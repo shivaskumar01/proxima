@@ -5,7 +5,7 @@
 // The per-query scan (l2sq_ny inside each query's worker) reloads every
 // centroid row once PER QUERY: nq * nlist * dim * 4 bytes of traffic. At
 // GIST scale (960-dim, nlist=1000) that is ~3.8 GB per 1000-query batch and
-// the scan is flatly bandwidth-bound — it is why FAISS (which batches the
+// the scan is flatly bandwidth-bound, it is why FAISS (which batches the
 // coarse scan as a matrix multiply) kept winning IVF-PQ at nprobe=1 even
 // after the LUT work was fixed. Tiling 4 queries x 4 centroids in registers
 // (l2sq_4x4) reuses each loaded block four times.

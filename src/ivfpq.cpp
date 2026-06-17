@@ -40,7 +40,7 @@ void IvfPqIndex::train(const float* data, std::size_t n) {
     }
     // PQ codebooks need n >= KSUB per subspace (each subspace runs kmeans
     // with k=KSUB). Without this, kmeans clamps k to n and returns a smaller
-    // codebook than the M*KSUB*dsub_ memcpy below assumes — silent OOB read.
+    // codebook than the M*KSUB*dsub_ memcpy below assumes, silent OOB read.
     if (n < KSUB) {
         throw std::invalid_argument(
             "IVF-PQ: training set smaller than KSUB (256); PQ codebooks would be undertrained");
@@ -53,7 +53,7 @@ void IvfPqIndex::train(const float* data, std::size_t n) {
            coarse_centroids_, &coarse_assign, /*nthreads=*/0);
 
     // 2. PQ training input: residuals for L2 (r_i = x_i - centroid), the raw
-    //    vectors for IP (no residual encoding — see header).
+    //    vectors for IP (no residual encoding, see header).
     const float* pq_train = data;
     std::vector<float> residuals;
     if (metric_ == Metric::L2) {
@@ -100,7 +100,7 @@ void IvfPqIndex::train(const float* data, std::size_t n) {
 
     // Full state reset: re-training invalidates any previously encoded codes
     // (they reference the old PQ codebooks). Wiping inv_labels_/inv_codes_ but
-    // not ntotal_ would silently drift label assignments — new add() calls
+    // not ntotal_ would silently drift label assignments, new add() calls
     // would start labels at the stale offset, leaving holes the user can't see.
     inv_labels_.assign(nlist_, {});
     inv_codes_.assign(nlist_, {});
@@ -250,7 +250,7 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
     if (nprobe > nlist_) nprobe = nlist_;
 
     // Scratch buffers allocated once per thread, reused across that thread's
-    // queries. ADC lookup table is M * KSUB floats — for M=8 that's 8KB,
+    // queries. ADC lookup table is M * KSUB floats, for M=8 that's 8KB,
     // fits in L1d.
     struct SearchCtx {
         std::vector<float>   coarse_d;   // per-query path only
@@ -260,7 +260,7 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
     };
 
     // Phase 1 of each slab: the coarse scan for a block of queries at once,
-    // 4 queries x 4 centroids register-tiled (see coarse.hpp — at high dim
+    // 4 queries x 4 centroids register-tiled (see coarse.hpp, at high dim
     // this scan is bandwidth-bound and dominates low-nprobe searches).
     // The phase-split batched scan trades an extra coarse-matrix round-trip
     // and a phase barrier for 4x less centroid traffic. Measured: +20-44%
@@ -329,7 +329,7 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
 
         // 2. Build the query dot-table ONCE: qdot[m*KSUB+k] = s * <q_m, r_mk>
         //    with s = -2 for the L2 expansion and s = -1 for IP (where the
-        //    negated dot table IS the whole ADC table — no per-probe work).
+        //    negated dot table IS the whole ADC table, no per-probe work).
         //    Same NEON tile (transposed codebooks, 16 entries in 4 registers
         //    across the dsub reduction), amortized across all probes.
         const float qdot_scale = (metric_ == Metric::L2) ? -2.0f : -1.0f;
@@ -383,10 +383,10 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
             if (n_c == 0) continue;
 
             // 3. Per-probe ADC table.
-            //    L2: streaming MERGE of two tables plus the coarse bias —
+            //    L2: streaming MERGE of two tables plus the coarse bias, 
             //      lut[m][k] = precomp[c][m][k] + qdot[m][k], with
             //      bias = ||q - c||^2 folded into subspace 0.
-            //    IP: the (negated) query dot-table IS the table — no
+            //    IP: the (negated) query dot-table IS the table, no
             //      per-probe work at all; just point at it.
             const float* lut_p = qdot.data();   // IP: dot table IS the table
             if (metric_ == Metric::L2) {

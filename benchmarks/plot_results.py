@@ -9,7 +9,7 @@ Memory model: the default invocation re-execs itself once per series
 data, builds ONE index, measures, merges its points into the results JSON,
 and exits. Combined with the chunk-streamed loaders this keeps peak RSS
 around base+index for the current series only (~5 GB for GIST1M) instead of
-accumulating every index and numpy temporary in one long-lived process —
+accumulating every index and numpy temporary in one long-lived process, 
 the all-in-one version drove a 16 GB machine deep into swap on GIST1M,
 where it burned an hour inside the memory compressor without finishing a
 single build.
@@ -143,7 +143,7 @@ def run_series(dataset: str, name: str) -> list[tuple[float, float]]:
         idx = faiss.IndexHNSWFlat(d, 16)
         idx.hnsw.efConstruction = 200
         # Chunked add. faiss has no reserve(), so each add realloc-copies its
-        # storage vector (brief old+new transients) — but that beats holding
+        # storage vector (brief old+new transients), but that beats holding
         # a full 3.8 GB numpy copy NEXT TO faiss's internal copy for the
         # whole multi-minute build: the full-load variant sat at ~7.7 GB
         # sustained and swap-thrashed for an hour+ on GIST1M on a 16 GB
@@ -271,7 +271,7 @@ def plot(dataset: str) -> None:
     ax.set_xlabel("recall@10")
     ax.set_ylabel("QPS (queries per second)")
     ax.set_yscale("log")
-    ax.set_title(f"{title_dataset} — recall@10 vs QPS (Apple M2 Pro, std::thread)")
+    ax.set_title(f"{title_dataset}, recall@10 vs QPS (Apple M2 Pro, std::thread)")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(loc="lower left", fontsize=9)
     fig.tight_layout()

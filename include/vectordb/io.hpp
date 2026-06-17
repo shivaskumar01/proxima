@@ -2,7 +2,7 @@
 
 // Tiny binary I/O helpers for index serialization.
 //
-// All numeric fields are little-endian POD writes — Apple Silicon and x86-64
+// All numeric fields are little-endian POD writes, Apple Silicon and x86-64
 // are both LE so we don't byte-swap. Files are NOT cross-version: the magic+
 // version header detects mismatches and throws.
 

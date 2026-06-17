@@ -52,12 +52,12 @@ void dot_ny(float* out, const float* q, const float* base,
 
 // Register-tiled 4-queries x 4-rows L2sq: out[i*4 + j] = ||q_i - c_j||^2.
 // Each loaded q/c block is reused four times, cutting memory traffic ~4x
-// versus four l2sq_ny passes — this is the GEMM-style blocking that makes
+// versus four l2sq_ny passes, this is the GEMM-style blocking that makes
 // a query-batched IVF coarse scan competitive at high dim, where the scan
 // is bandwidth-bound. One accumulator chain per pair (16 live), so results
 // are NOT bit-matched to l2sq()/l2sq_x4(); callers must not mix kernels
 // inside a comparison whose termination depends on consistency (sorts and
-// bounded heaps are fine — see the greedy-descent war story).
+// bounded heaps are fine, see the greedy-descent war story).
 void l2sq_4x4(const float* q, std::size_t q_stride,
               const float* c, std::size_t c_stride,
               std::size_t d, float* out) noexcept;

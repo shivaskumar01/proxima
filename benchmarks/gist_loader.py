@@ -2,7 +2,7 @@
 
 Same TexMex .fvecs/.ivecs format as SIFT1M, just larger and harder:
 1M base vectors at 960 dimensions (~3.6 GB on disk), 1000 queries.
-The high dimensionality is what makes this a useful credibility check —
+The high dimensionality is what makes this a useful credibility check, 
 ANN tricks that work on 128-dim SIFT can fall apart at 960-dim.
 """
 
@@ -27,7 +27,7 @@ DEFAULT_DIR = Path.home() / "vectordb" / "data" / "gist"
 
 
 def load_gist1m(root: str | Path = DEFAULT_DIR):
-    """Returns (xb, xq, gt) — base 1M*960, queries 1000*960, ground-truth 1000*100."""
+    """Returns (xb, xq, gt), base 1M*960, queries 1000*960, ground-truth 1000*100."""
     root = Path(root)
     xb_path = root / "gist_base.fvecs"
     xq_path = root / "gist_query.fvecs"

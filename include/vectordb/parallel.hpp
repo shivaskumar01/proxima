@@ -1,7 +1,7 @@
 #pragma once
 
 // Tiny std::thread-based parallel_for. We don't use OpenMP because faiss-cpu
-// bundles its own libomp and macOS dyld refuses to load a second one — using
+// bundles its own libomp and macOS dyld refuses to load a second one, using
 // std::thread keeps us from being dependency-incompatible with FAISS in the
 // same Python process.
 

@@ -38,7 +38,7 @@ def fvecs_read(path: str | Path, lo: int = 0, hi: int | None = None) -> np.ndarr
     """Read rows [lo, hi) of an .fvecs file as float32.
 
     Memmap + chunked column-strip: the old np.fromfile + .copy() version
-    held BOTH the raw int32 array and the stripped copy at peak — 7.7 GB
+    held BOTH the raw int32 array and the stripped copy at peak, 7.7 GB
     transient for GIST1M, which alone could push a 16 GB machine into swap.
     This version peaks at the output array + one ~128 MB chunk.
     """
@@ -78,7 +78,7 @@ def ivecs_read(path: str | Path) -> np.ndarray:
 
 
 def load_sift1m(root: str | Path = DEFAULT_DIR):
-    """Returns (xb, xq, gt) — base 1M*128, queries 10K*128, ground-truth 10K*100."""
+    """Returns (xb, xq, gt), base 1M*128, queries 10K*128, ground-truth 10K*100."""
     root = Path(root)
     xb_path = root / "sift_base.fvecs"
     xq_path = root / "sift_query.fvecs"

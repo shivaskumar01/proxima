@@ -371,7 +371,7 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
         // UNDERESTIMATE exact distances, so the SIMD pass is a lossless
         // filter). For L2 both happen per probe (the table depends on the
         // probed centroid); for IP the negated dot table IS the table and
-        // is probe-independent — built and quantized ONCE per query.
+        // is probe-independent, built and quantized ONCE per query.
         const float* lut_f = ctx.qdot.data();
         uint8_t* lut8 = ctx.lut8.data();
         float qdelta = 1.0f, inv_delta = 1.0f, qbase = 0.0f;
@@ -472,8 +472,8 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
                 }
 
                 // 6. SIMD survivor mask: compare all 16 lanes against the
-                //    quantized threshold at once. The common steady state —
-                //    a tight top-k and no survivors in the block — is one
+                //    quantized threshold at once. The common steady state, 
+                //    a tight top-k and no survivors in the block, is one
                 //    compare + one reduction + one branch, with no per-lane
                 //    work at all. Survivor lanes (rare) are walked via the
                 //    narrowed bitmask instead of a 16-iteration loop.

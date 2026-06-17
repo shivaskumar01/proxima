@@ -22,7 +22,7 @@ public:
     // Pre-size internal storage for a total of n vectors. Callers streaming
     // the dataset in chunks should reserve once up front: without it the
     // backing vector's geometric growth peaks at ~2x the final footprint
-    // during the last realloc (old + new buffer live simultaneously) —
+    // during the last realloc (old + new buffer live simultaneously), 
     // enough to push a 1M x 960 build into swap on a 16 GB machine.
     void reserve(std::size_t n) { data_.reserve(n * dim_); }
 

@@ -44,7 +44,7 @@ std::size_t FlatIndex::remove_ids(const label_t* labels, std::size_t n) {
 
 namespace {
 // Max-heap of (distance, label). For L2 we minimize distance; for IP we
-// negate so smaller-is-better still applies — keeps one heap implementation.
+// negate so smaller-is-better still applies, keeps one heap implementation.
 struct HeapEntry {
     float distance;
     label_t label;
@@ -59,8 +59,8 @@ void FlatIndex::search(const float* queries, std::size_t nq, std::size_t k,
     if (k == 0) return;  // caller asked for nothing; no work, no UB on heap.top()
     const bool is_l2 = (metric_ == Metric::L2);
 
-    // Brute force is embarrassingly parallel and the workload is balanced —
-    // every query scans every vector — so a stride schedule is fine.
+    // Brute force is embarrassingly parallel and the workload is balanced, 
+    // every query scans every vector, so a stride schedule is fine.
     parallel_for(nq, [&](std::size_t qi) {
         const float* q = queries + qi * dim_;
 

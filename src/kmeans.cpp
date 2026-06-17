@@ -65,7 +65,7 @@ namespace {
 //
 // Parallelism note: only the min_d2 refresh is parallel (per-point
 // independent, so bitwise-deterministic). The cumulative-sum sampling stays
-// serial — a parallel reduction would change float summation order and with
+// serial, a parallel reduction would change float summation order and with
 // it the sampled index, breaking seed-determinism across thread counts.
 void kmeanspp_init(const float* data, std::size_t n, std::size_t dim,
                    std::size_t k, std::mt19937_64& rng,

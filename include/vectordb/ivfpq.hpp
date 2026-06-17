@@ -17,7 +17,7 @@ namespace vectordb {
 //   - L2: PQ encodes RESIDUALS (x - coarse centroid); ADC uses the
 //     precomputed-table expansion (see precomp_ below).
 //   - InnerProduct: PQ encodes RAW vectors (residual-IP needs norm
-//     bookkeeping for little gain — FAISS also defaults by_residual=false
+//     bookkeeping for little gain, FAISS also defaults by_residual=false
 //     for IP). score = sum_m <q_m, y_m>, so the ADC table depends only on
 //     the query: built once per query, ZERO per-probe table work. Lists are
 //     assigned and probed by max <x, centroid>. Cosine = normalize your
@@ -72,7 +72,7 @@ private:
     // Caller passes a scratch buffer of size >= dsub_ for residual computation;
     // letting the caller own it lets add() reuse one buffer across many vectors
     // and avoids a fixed-size stack array (which used to silently overflow at
-    // dsub > 64 — bug found on GIST1M, M=8, dsub=120).
+    // dsub > 64, bug found on GIST1M, M=8, dsub=120).
     void encode_vector(const float* x, int32_t coarse_id,
                        uint8_t* out_code, float* r_sub_scratch) const;
 
@@ -98,7 +98,7 @@ private:
     // Transposed PQ codebooks: M * dsub * KSUB. Indexed as
     // [m*dsub*KSUB + j*KSUB + k]. Used by the per-query dot-table build so
     // the inner loop strides contiguously across all 256 codes for one
-    // (m, j) pair — enables a 4-wide NEON FMA tile.
+    // (m, j) pair, enables a 4-wide NEON FMA tile.
     std::vector<float> pq_codebooks_T_;
     void rebuild_codebooks_T();
 
@@ -109,7 +109,7 @@ private:
     // ||q - c||^2 is the coarse distance (already computed by the coarse
     // scan) and folds in as a per-probe scalar; -2<q_m, r_mk> is built once
     // per QUERY. The per-probe LUT build drops from O(M*KSUB*dsub) FLOPs to
-    // an O(M*KSUB) table merge — the dsub factor (120 on GIST1M with M=8)
+    // an O(M*KSUB) table merge, the dsub factor (120 on GIST1M with M=8)
     // is why FAISS used to win GIST IVF-PQ at every nprobe.
     // Size nlist*M*KSUB floats (8-16 MB typical); rebuilt by train()/load(),
     // never serialized.

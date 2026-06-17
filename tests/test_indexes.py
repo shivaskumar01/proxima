@@ -165,7 +165,7 @@ def test_ivfpq_large_dsub():
     idx.train(data); idx.add(data)
     _, _ = idx.search(data[:5], k=3, nprobe=4)
 
-    # Now exercise dsub > 64 — would have crashed previously.
+    # Now exercise dsub > 64, would have crashed previously.
     d, M = 960, 8           # dsub = 120
     data = gen_data(n, d)
     idx = IvfPqIndex(dim=d, nlist=16, M=M, kmeans_iters=10, seed=0)
@@ -491,7 +491,7 @@ def test_hnsw_streaming_small_adds():
 
 def test_flat_distances_exact_on_batch_tail():
     """n=7 rows: one 4-wide batch + 3 single-pair tail rows. Distances from
-    both paths must agree with numpy — guards the batched-kernel tail."""
+    both paths must agree with numpy, guards the batched-kernel tail."""
     d = 24
     data = gen_data(7, d)
     queries = gen_data(3, d)
@@ -828,7 +828,7 @@ def test_flat_remove_ids():
     # Survivors still find themselves (labels stable).
     assert L[1, 0] == 1 and L[2, 0] == 2
 
-    # New adds mint fresh labels — never reuse removed ones.
+    # New adds mint fresh labels, never reuse removed ones.
     idx.add(data[:3])
     assert idx.size == 199
     _, L2 = idx.search(data[:1], k=3)
@@ -985,7 +985,7 @@ def test_hnsw_delete_all_then_readd():
 # ---- multithread safety -------------------------------------------------
 
 def test_concurrent_search_threadsafe():
-    """Multiple Python threads search a shared index — no races, identical results."""
+    """Multiple Python threads search a shared index, no races, identical results."""
     import threading
 
     d = 16

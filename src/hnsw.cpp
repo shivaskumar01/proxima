@@ -77,7 +77,7 @@ id_t HnswIndex::greedy_descend(const float* q, id_t curr, int from, int to,
     // reproducible: each accepted hop strictly decreases a single scalar.
     //
     // The earlier version recomputed best = distance(q, vec(curr)) on every
-    // pass — with the single-pair kernel — while neighbors were evaluated
+    // pass, with the single-pair kernel, while neighbors were evaluated
     // with the batched kernel. Under -ffast-math those two kernels rounded
     // differently (~5% of pairs, few-ulp deltas), and on near-tie pairs the
     // inconsistent comparisons let greedy descent ping-pong A->B->A forever.
@@ -176,7 +176,7 @@ HnswIndex::search_layer(const float* q, id_t entry,
         }
 
         // Gather the unvisited neighbors (marking as we go) and prefetch
-        // their vectors — each is a random ~dim*4-byte load — then compute
+        // their vectors, each is a random ~dim*4-byte load, then compute
         // distances four at a time. Same neighbor order as a one-by-one
         // scan, so heap contents are identical.
         auto& batch = ctx.gather;
@@ -213,7 +213,7 @@ HnswIndex::select_neighbors_heuristic(const float* q,
                                       std::size_t M) const {
     // Algorithm 4 from the HNSW paper, simplified (no extension/keep-pruned).
     // Iterate candidates by ascending distance to q. Accept e iff it is closer
-    // to q than to every already-accepted neighbor — this enforces angular
+    // to q than to every already-accepted neighbor, this enforces angular
     // diversity and avoids redundant edges in the same direction.
     std::vector<PairF> W = candidates;
     std::sort(W.begin(), W.end(),
@@ -343,7 +343,7 @@ void HnswIndex::add(const float* data_in, std::size_t n) {
     // ---- Serial pre-phase: reserve every slot the parallel phase touches.
     // Vectors and levels are appended up front so data_ never reallocates
     // (and vec() stays valid) while worker threads run. Levels are drawn
-    // serially so the rng_ sequence — and the level distribution — is
+    // serially so the rng_ sequence, and the level distribution, is
     // deterministic regardless of thread count.
     data_.insert(data_.end(), data_in, data_in + n * dim_);
     level_.reserve(start + n);
@@ -381,7 +381,7 @@ void HnswIndex::add(const float* data_in, std::size_t n) {
     // node guards that node's link lists; entry_mtx guards entry_point_ and
     // max_level_. data_/level_ are read-only here. Lock order is one node
     // lock at a time, with entry_mtx never acquired while holding a node
-    // lock — no cycles, no deadlock.
+    // lock, no cycles, no deadlock.
     std::vector<std::mutex> locks(ntotal_);
     std::mutex entry_mtx;
     parallel_for<SearchCtx>(m,

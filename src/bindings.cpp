@@ -51,7 +51,7 @@ auto py_search(const Idx& self, FloatArr queries, std::size_t k) {
     const float* q = check_2d_dim(queries, self.dim(), "queries", &nq);
     py::array_t<float>   dists({nq, k});
     py::array_t<label_t> labels({nq, k});
-    // Resolve buffer pointers BEFORE releasing the GIL — request() calls back
+    // Resolve buffer pointers BEFORE releasing the GIL, request() calls back
     // into Python and segfaults if the GIL is dropped.
     float*   d_ptr = static_cast<float*>(dists.request().ptr);
     label_t* l_ptr = static_cast<label_t*>(labels.request().ptr);
