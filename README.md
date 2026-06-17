@@ -101,10 +101,14 @@ loaded = HnswIndex.load("hnsw.bin")
 .venv/bin/python benchmarks/plot_results.py --dataset gist1m
 ```
 
-CI builds and tests three flavors on every push: `macos-14` (NEON),
-`macos-14` with `-DVECTORDB_FORCE_SCALAR=ON`, and x86 `ubuntu` (scalar) —
-the scalar fallbacks had never been compiled before the matrix existed,
-which is exactly how fallback bit-rot happens.
+CI builds and tests five flavors on every push: `macos-14` (NEON),
+`macos-14` with `-DVECTORDB_FORCE_SCALAR=ON`, and x86 `ubuntu` (scalar) run
+the pytest suite; two more (`-DVECTORDB_ASAN=ON`, NEON and scalar) build
+`tests/cpp/asan_smoke.cpp` and drive every index through
+add/remove/re-add/search/save-load under AddressSanitizer. The scalar
+fallbacks had never been compiled before the matrix existed, and the v5
+zero-length-buffer segfault would have tripped the ASan jobs — both are
+exactly how this class of bug hides.
 
 `plot_results.py` re-execs itself once per series so each sweep runs in its
 own process: load → build one index → measure → merge into the JSON → exit.
