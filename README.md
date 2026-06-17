@@ -5,6 +5,11 @@ Python bindings on top. I built it to learn how production ANN libraries
 (FAISS, hnswlib, ScaNN) work underneath, so it is not a drop-in replacement
 for any of them.
 
+## API keys
+
+None. vectordb builds and runs offline. The only optional downloads are the
+SIFT1M and GIST1M benchmark datasets, and neither needs a key.
+
 ## What's in here
 
 | Index       | Algorithm                                     | Build  | Memory          |
