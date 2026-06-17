@@ -925,6 +925,63 @@ def test_remove_ids_survives_save_load(tmp_path):
     assert loaded2.size == 496
 
 
+def test_remove_ids_inner_product():
+    """IP + remove_ids for every deletable index (the L2 delete tests don't
+    cover the negated-score path through the heap)."""
+    d, n = 32, 3000
+    data = gen_data(n, d)
+    data /= np.linalg.norm(data, axis=1, keepdims=True)
+    queries = gen_data(20, d)
+    queries /= np.linalg.norm(queries, axis=1, keepdims=True)
+    kill = np.arange(0, n, 4, dtype=np.int64)
+
+    # HNSW IP tombstones
+    h = HnswIndex(dim=d, metric="ip", M=16, ef_construction=100, seed=2)
+    h.add(data)
+    assert h.remove_ids(kill) == len(kill)
+    Dh, Lh = h.search(queries, k=10, ef=64)
+    live = Lh[Lh >= 0]
+    assert not np.isin(live, kill).any()
+    # IP scores are dot products: descending along k.
+    assert np.all(np.diff(Dh, axis=1) <= 1e-3)
+
+    # IVF-PQ + fast-scan IP physical removal
+    for cls in (IvfPqIndex, IvfPqFastScan):
+        idx = cls(dim=d, nlist=16, M=8, kmeans_iters=10, seed=2, metric="ip")
+        idx.train(data)
+        idx.add(data)
+        assert idx.remove_ids(kill) == len(kill)
+        assert idx.size == n - len(kill)
+        D, L = idx.search(queries, k=10, nprobe=16)
+        live = L[L >= 0]
+        assert not np.isin(live, kill).any(), cls.__name__
+        assert np.all(np.diff(D, axis=1) <= 1e-3), cls.__name__
+
+
+def test_hnsw_delete_all_then_readd():
+    """nlive_ -> 0 then add(): the stale (tombstoned) entry point must still
+    route new inserts, and search must find only the re-added vectors."""
+    d = 16
+    first = gen_data(400, d)
+    idx = HnswIndex(dim=d, metric="l2", M=16, ef_construction=100, seed=3)
+    idx.add(first)
+    idx.remove_ids(np.arange(400, dtype=np.int64))   # delete everything
+    assert idx.size == 0
+    D, L = idx.search(gen_data(3, d), k=5, ef=32)
+    assert (L == -1).all()                            # nothing live
+
+    second = gen_data(400, d)
+    idx.add(second)                                   # labels 400..799
+    assert idx.size == 400
+    flat = FlatIndex(dim=d, metric="l2")
+    flat.add(second)
+    q = gen_data(40, d)
+    _, truth = flat.search(q, k=10)
+    _, pred = idx.search(q, k=10, ef=64)
+    assert (pred[pred >= 0] >= 400).all()             # only re-added labels
+    assert recall_at_k(pred, truth + 400, k=10) >= 0.85
+
+
 # ---- multithread safety -------------------------------------------------
 
 def test_concurrent_search_threadsafe():

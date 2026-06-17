@@ -12,3 +12,4 @@ data/
 benchmarks/results_*.json
 *.zip
 build-scalar/
+build-asan*/

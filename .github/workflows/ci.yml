@@ -36,3 +36,30 @@ jobs:
         run: cmake --build build -j
       - name: Test
         run: python -m pytest tests/ -v
+
+  asan:
+    name: asan-${{ matrix.scalar == 'ON' && 'scalar' || 'neon' }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        scalar: ["OFF", "ON"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # pybind11 is only needed for the unconditional find_package; the ASan
+      # config builds the standalone harness, not the module.
+      - name: Install pybind11
+        run: python -m pip install pybind11
+      - name: Configure (ASan)
+        run: >
+          cmake -S . -B build-asan
+          -DPython3_EXECUTABLE=$(which python)
+          -DVECTORDB_ASAN=ON
+          -DVECTORDB_FORCE_SCALAR=${{ matrix.scalar }}
+      - name: Build harness
+        run: cmake --build build-asan -j
+      - name: Run under AddressSanitizer
+        run: ASAN_OPTIONS=detect_leaks=0 ./build-asan/asan_smoke
