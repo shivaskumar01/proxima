@@ -1,4 +1,4 @@
-# vectordb
+# Proxima
 
 I wrote HNSW and IVF-PQ vector indexes by hand in C++17, with NumPy-friendly
 Python bindings on top. I built it to learn how production ANN libraries
@@ -7,7 +7,7 @@ for any of them.
 
 ## API keys
 
-None. vectordb builds and runs offline. The only optional downloads are the
+None. Proxima builds and runs offline. The only optional downloads are the
 SIFT1M and GIST1M benchmark datasets, and neither needs a key.
 
 ## What's in here
@@ -37,6 +37,18 @@ digs past arbitrarily many tombstones. Post-delete recall on survivors
 measures ≥0.85 after deleting 30% of a graph. File formats bump (Flat v2:
 explicit labels; HNSW v2: tombstone bitmap); v1 files still load.
 
+Updates: every index supports `update(labels, vectors)`, which replaces
+the vectors stored under existing labels without changing the labels. A
+batch is checked up front: an unknown or removed label raises `KeyError`,
+a duplicate raises `ValueError`, and nothing is modified. Flat overwrites
+in place. IVF-PQ re-encodes, and a vector whose coarse assignment changed
+moves to its new list with its label. HNSW follows hnswlib's `updatePoint`:
+the node keeps its id and level, each of its neighbors re-selects its
+edges from the two-hop neighborhood, and the node is then re-linked the
+way an insert would. After rewriting 30% and then 100% of a 2k-vector
+graph, recall@10 matches a fresh build of the same data (0.99 vs 0.99,
+200 queries, d=32). No format change: an updated index saves and loads as before.
+
 Metrics: every index supports `metric="l2"` and `metric="ip"` (inner
 product; cosine = normalize your vectors and queries first). IP IVF-PQ
 follows FAISS's raw-vector-encoding design but measures *better* than
@@ -50,7 +62,7 @@ variant quantizes once per query too.
 ## Build
 
 ```bash
-cd ~/vectordb
+git clone https://github.com/shivaskumar01/proxima.git && cd proxima
 python3 -m venv .venv
 .venv/bin/pip install numpy faiss-cpu pybind11 pytest matplotlib
 cmake -S . -B build -DPython3_EXECUTABLE=$(pwd)/.venv/bin/python
@@ -58,15 +70,15 @@ cmake --build build -j
 .venv/bin/python -m pytest tests/ -v
 ```
 
-The compiled extension lands in `python/vectordb/_vectordb.*.so`. The Python
-shim (`python/vectordb/__init__.py`) re-exports the four index classes, so
-benchmarks and tests just `from vectordb import HnswIndex`.
+The compiled extension lands in `python/proxima/_proxima.*.so`. The Python
+shim (`python/proxima/__init__.py`) re-exports the four index classes, so
+benchmarks and tests just `from proxima import HnswIndex`.
 
 ## Use
 
 ```python
 import numpy as np
-from vectordb import HnswIndex, IvfPqIndex
+from proxima import HnswIndex, IvfPqIndex
 
 xb = np.random.randn(100_000, 128).astype("float32")
 xq = np.random.randn(100, 128).astype("float32")
@@ -92,6 +104,10 @@ ip.train(xn[:50_000]); ip.add(xn)
 # (nodes keep routing, memory not reclaimed); the others compact physically.
 removed = ivf.remove_ids(np.array([3, 17, 42], dtype=np.int64))
 
+# Updates: replace vectors in place, same labels. The whole batch is
+# rejected (KeyError / ValueError) if any label is unknown or repeated.
+idx.update(np.array([5, 9], dtype=np.int64), xb[:2] + 0.1)
+
 # Persistence, round-trip preserves search results bit-for-bit.
 idx.save("hnsw.bin")
 loaded = HnswIndex.load("hnsw.bin")
@@ -109,8 +125,8 @@ loaded = HnswIndex.load("hnsw.bin")
 ```
 
 CI builds and tests five flavors on every push: `macos-14` (NEON),
-`macos-14` with `-DVECTORDB_FORCE_SCALAR=ON`, and x86 `ubuntu` (scalar) run
-the pytest suite; two more (`-DVECTORDB_ASAN=ON`, NEON and scalar) build
+`macos-14` with `-DPROXIMA_FORCE_SCALAR=ON`, and x86 `ubuntu` (scalar) run
+the pytest suite; two more (`-DPROXIMA_ASAN=ON`, NEON and scalar) build
 `tests/cpp/asan_smoke.cpp` and drive every index through
 add/remove/re-add/search/save-load under AddressSanitizer. The scalar
 fallbacks had never been compiled before the matrix existed, and the v5
@@ -481,7 +497,7 @@ of `std::vector<bool> visited(n)` would memset N bytes per query call;
 incrementing a `uint32_t` instead is O(1) per query, with a single full
 reset only when the counter wraps (~4B searches in).
 
-6. Parallel batch search via std::thread (`include/vectordb/parallel.hpp`):
+6. Parallel batch search via std::thread (`include/proxima/parallel.hpp`):
 each query is independent; a stride-scheduled `parallel_for` fans out across
 `hardware_concurrency()` workers. Per-thread context (HNSW SearchCtx,
 IVF-PQ ADC LUT scratch) is built once per worker and reused across that
@@ -537,11 +553,11 @@ What measurably remains:
 ## Layout
 
 ```
-vectordb/
+proxima/
 ├── CMakeLists.txt
-├── include/vectordb/   # public headers
+├── include/proxima/   # public headers
 ├── src/                # C++ implementations + pybind11 bindings
-├── python/vectordb/    # Python package; .so lands here after build
+├── python/proxima/    # Python package; .so lands here after build
 ├── tests/              # pytest correctness tests vs Flat
 └── benchmarks/         # SIFT1M loader + side-by-side FAISS bench
 ```

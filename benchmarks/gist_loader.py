@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sift_loader import fvecs_read, ivecs_read  # noqa: E402
 
 GIST1M_URL = "ftp://ftp.irisa.fr/local/texmex/corpus/gist.tar.gz"  # ~2.6 GB
-DEFAULT_DIR = Path.home() / "vectordb" / "data" / "gist"
+DEFAULT_DIR = Path(__file__).resolve().parents[1] / "data" / "gist"   # <repo>/data/gist
 
 
 def load_gist1m(root: str | Path = DEFAULT_DIR):
@@ -65,7 +65,7 @@ def download_gist1m(dest: str | Path = DEFAULT_DIR) -> None:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--download", action="store_true",
-                   help="download GIST1M into ~/vectordb/data/gist/")
+                   help="download GIST1M into <repo>/data/gist/")
     p.add_argument("--describe", action="store_true",
                    help="describe the dataset on disk")
     args = p.parse_args()

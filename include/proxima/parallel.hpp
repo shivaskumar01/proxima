@@ -10,7 +10,7 @@
 #include <thread>
 #include <vector>
 
-namespace vectordb {
+namespace proxima {
 
 inline unsigned default_num_threads() noexcept {
     unsigned t = std::thread::hardware_concurrency();
@@ -58,4 +58,4 @@ void parallel_for(std::size_t n, Body body, unsigned nthreads = 0) {
         nthreads);
 }
 
-}  // namespace vectordb
+}  // namespace proxima

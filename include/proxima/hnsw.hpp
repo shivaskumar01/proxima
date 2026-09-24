@@ -1,6 +1,6 @@
 #pragma once
 
-#include "vectordb/types.hpp"
+#include "proxima/types.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-namespace vectordb {
+namespace proxima {
 
 // Per-thread visited tracker. The generation counter lets us "reset" the
 // whole buffer in O(1) by bumping the counter; only when it wraps do we
@@ -77,6 +77,13 @@ public:
     // but never appear in results. Memory is not reclaimed; labels (= node
     // ids) stay stable. Returns the number newly marked.
     std::size_t remove_ids(const label_t* labels, std::size_t n);
+
+    // Replace the vectors of n live labels in place (hnswlib updatePoint):
+    // the node keeps its id, so its label and level do not change, and
+    // the graph around it is re-linked for the new position. Serial.
+    // Throws std::out_of_range for an unknown or removed label and
+    // std::invalid_argument for a duplicate, before modifying anything.
+    void update(const label_t* labels, const float* data, std::size_t n);
 
     std::size_t size() const noexcept { return nlive_; }   // live nodes
     std::size_t dim()  const noexcept { return dim_; }
@@ -151,6 +158,9 @@ private:
     void insert_one(id_t id, SearchCtx& ctx,
                     std::mutex* locks, std::mutex* entry_mtx);
 
+    // Move node `id` to vector v and repair the graph around it.
+    void update_one(id_t id, const float* v, SearchCtx& ctx);
+
     std::size_t dim_;
     Metric      metric_;
     std::size_t M_;
@@ -173,4 +183,4 @@ private:
     mutable std::mt19937_64 rng_;
 };
 
-}  // namespace vectordb
+}  // namespace proxima

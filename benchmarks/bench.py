@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
-from vectordb import FlatIndex, HnswIndex, IvfPqIndex  # noqa: E402
+from proxima import FlatIndex, HnswIndex, IvfPqIndex  # noqa: E402
 
 try:
     import faiss

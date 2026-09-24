@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 
 SIFT1M_URL = "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz"  # 161 MB
-DEFAULT_DIR = Path.home() / "vectordb" / "data" / "sift"
+DEFAULT_DIR = Path(__file__).resolve().parents[1] / "data" / "sift"   # <repo>/data/sift
 
 
 def _fvecs_mm(path: str | Path) -> np.ndarray:
@@ -120,7 +120,7 @@ def download_sift1m(dest: str | Path = DEFAULT_DIR) -> None:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--download", action="store_true",
-                   help="download SIFT1M into ~/vectordb/data/sift/")
+                   help="download SIFT1M into <repo>/data/sift/")
     p.add_argument("--describe", action="store_true",
                    help="describe the dataset on disk")
     args = p.parse_args()

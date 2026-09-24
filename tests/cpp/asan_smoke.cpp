@@ -2,16 +2,17 @@
 // indexes across both metrics, with deletes, re-adds, partial fast-scan
 // blocks, and save/load round-trips. Adversarial sizes (non-multiples of 4
 // and 16 for tails; list counts not divisible by BLOCK=16 for fast-scan).
-#include "vectordb/flat.hpp"
-#include "vectordb/hnsw.hpp"
-#include "vectordb/ivfpq.hpp"
-#include "vectordb/ivfpq_fs.hpp"
+#include "proxima/flat.hpp"
+#include "proxima/hnsw.hpp"
+#include "proxima/ivfpq.hpp"
+#include "proxima/ivfpq_fs.hpp"
 
 #include <cstdio>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
-using namespace vectordb;
+using namespace proxima;
 
 static std::vector<float> rnd(std::size_t n, std::size_t d, uint32_t seed) {
     std::mt19937 rng(seed);
@@ -32,6 +33,20 @@ static void check_search(const char* tag, std::size_t nq, std::size_t k,
             std::abort();
         }
     }
+}
+
+// A batch holding one unknown label must throw before touching the index.
+template <typename Idx>
+static void expect_update_throws(Idx& idx, std::size_t d) {
+    std::vector<label_t> bad{2, 999999};
+    auto v = rnd(2, d, 11);
+    try {
+        idx.update(bad.data(), v.data(), 2);
+    } catch (const std::out_of_range&) {
+        return;
+    }
+    std::printf("FAIL: update with an unknown label did not throw\n");
+    std::abort();
 }
 
 template <typename Factory>
@@ -67,6 +82,18 @@ static void exercise_ivf(const char* tag, Factory make, std::size_t d) {
     idx.add(data.data(), 50);
     idx.search(q.data(), 37, 10, 8, D.data(), L.data());
 
+    // Update a scattered set of live labels (mix of in-place rewrites and
+    // cross-list moves, incl. the newest labels in partial blocks), then a
+    // batch with a bad label that must be rejected without side effects.
+    std::vector<label_t> upd;
+    for (label_t l = 1; l < (label_t)n; l += 13) if (l % 7) upd.push_back(l);
+    upd.push_back((label_t)n + 49);
+    auto fresh = rnd(upd.size(), d, 10);
+    idx.update(upd.data(), fresh.data(), upd.size());
+    idx.search(q.data(), 37, 10, 8, D.data(), L.data());
+    check_search(tag, 37, 10, D, L, (label_t)n + 50);
+    expect_update_throws(idx, d);
+
     std::printf("ok %s: removed=%zu, size after re-add=%zu\n",
                 tag, removed, idx.size());
 }
@@ -85,6 +112,11 @@ int main() {
         std::vector<label_t> kill{0, 3, 9, 200, 516, 999999};
         idx.remove_ids(kill.data(), kill.size());
         idx.add(data.data(), 4);                    // re-add: new labels
+        idx.search(q.data(), 13, 7, D.data(), L.data());
+        std::vector<label_t> upd{1, 515, 517, 520}; // first/last survivors + re-adds
+        auto fresh = rnd(upd.size(), d, 12);
+        idx.update(upd.data(), fresh.data(), upd.size());
+        expect_update_throws(idx, d);
         idx.search(q.data(), 13, 7, D.data(), L.data());
         idx.save("/tmp/_asan_flat.bin");
         FlatIndex r = FlatIndex::load("/tmp/_asan_flat.bin");
@@ -107,6 +139,14 @@ int main() {
         idx.remove_ids(kill.data(), kill.size());
         idx.search(q.data(), 20, 10, 64, D.data(), L.data());  // must dig past tombstones
         idx.add(data.data(), 200);                  // incremental add after delete
+        idx.search(q.data(), 20, 10, 64, D.data(), L.data());
+        // Re-link live nodes among tombstones: the 5 survivors plus every
+        // re-added node (the entry point may be among them).
+        std::vector<label_t> upd;
+        for (label_t l = (label_t)(n - 5); l < (label_t)(n + 200); ++l) upd.push_back(l);
+        auto fresh = rnd(upd.size(), d, 13);
+        idx.update(upd.data(), fresh.data(), upd.size());
+        expect_update_throws(idx, d);               // label 2 is a tombstone
         idx.search(q.data(), 20, 10, 64, D.data(), L.data());
         idx.save("/tmp/_asan_hnsw.bin");
         HnswIndex r = HnswIndex::load("/tmp/_asan_hnsw.bin");

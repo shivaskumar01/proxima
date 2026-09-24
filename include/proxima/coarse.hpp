@@ -13,12 +13,12 @@
 // Callers process queries in slabs and pass a (slab_n x nlist) output
 // buffer, bounding memory instead of materializing an nq x nlist matrix.
 
-#include "vectordb/distance.hpp"
-#include "vectordb/parallel.hpp"
+#include "proxima/distance.hpp"
+#include "proxima/parallel.hpp"
 
 #include <cstddef>
 
-namespace vectordb {
+namespace proxima {
 
 // Queries processed in blocks of 4 per worker; remainder queries fall back
 // to the row-wise kernel. out[(qi)*nlist + c] = ||q_qi - cent_c||^2.
@@ -61,4 +61,4 @@ inline void coarse_scan_block(float* out,
 // (16 MB at nlist=1024) keeps the buffer L2/L3-friendly and bounded.
 constexpr std::size_t kCoarseSlab = 4096;
 
-}  // namespace vectordb
+}  // namespace proxima

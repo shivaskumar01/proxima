@@ -4,7 +4,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace vectordb {
+namespace proxima {
 
 using label_t = int64_t;
 using id_t    = uint32_t;   // internal node id, supports up to 4B vectors
@@ -20,4 +20,4 @@ inline Metric parse_metric(const std::string& s) {
     throw std::invalid_argument("unknown metric: " + s);
 }
 
-}  // namespace vectordb
+}  // namespace proxima

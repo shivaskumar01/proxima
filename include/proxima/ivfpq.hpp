@@ -1,13 +1,13 @@
 #pragma once
 
-#include "vectordb/types.hpp"
+#include "proxima/types.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
 
-namespace vectordb {
+namespace proxima {
 
 // IVF-PQ: coarse Inverted-File partitioning + Product Quantization. Memory
 // ~ M bytes per vector; search is dominated by an L1-resident lookup-table
@@ -46,6 +46,13 @@ public:
     // count). Returns the number removed.
     std::size_t remove_ids(const label_t* labels, std::size_t n);
 
+    // Re-encode the vectors of n existing labels, keeping the labels. A
+    // vector whose coarse assignment is unchanged is rewritten in place;
+    // one that now belongs to another list moves there. Throws
+    // std::out_of_range for a label not in the index and
+    // std::invalid_argument for a duplicate, before modifying anything.
+    void update(const label_t* labels, const float* data, std::size_t n);
+
     // Search top-k. nprobe controls the recall/QPS knob: lists scanned per query.
     void search(const float* queries, std::size_t nq, std::size_t k,
                 std::size_t nprobe,
@@ -75,6 +82,13 @@ private:
     // dsub > 64, bug found on GIST1M, M=8, dsub=120).
     void encode_vector(const float* x, int32_t coarse_id,
                        uint8_t* out_code, float* r_sub_scratch) const;
+
+    // Coarse-assign + PQ-encode n vectors in parallel (shared by add/update).
+    void assign_and_encode(const float* data, std::size_t n,
+                           int32_t* coarse, uint8_t* codes) const;
+
+    // Append one encoded vector to list c. Does not touch ntotal_.
+    void append(int32_t c, label_t label, const uint8_t* code);
 
     std::size_t dim_;
     std::size_t nlist_;
@@ -123,4 +137,4 @@ private:
     std::vector<std::vector<uint8_t>> inv_codes_;   // each: n_list * M bytes
 };
 
-}  // namespace vectordb
+}  // namespace proxima

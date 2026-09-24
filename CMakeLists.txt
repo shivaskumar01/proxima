@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(vectordb LANGUAGES CXX)
+project(proxima LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -46,16 +46,16 @@ set(CORE_SRC
   src/ivfpq_fs.cpp
 )
 
-add_library(vectordb_core STATIC ${CORE_SRC})
-target_include_directories(vectordb_core PUBLIC include)
-target_compile_options(vectordb_core PRIVATE -Wall -Wextra -Wno-unused-parameter)
-target_link_libraries(vectordb_core PUBLIC Threads::Threads)
+add_library(proxima_core STATIC ${CORE_SRC})
+target_include_directories(proxima_core PUBLIC include)
+target_compile_options(proxima_core PRIVATE -Wall -Wextra -Wno-unused-parameter)
+target_link_libraries(proxima_core PUBLIC Threads::Threads)
 
 # Compile the scalar fallback paths even on ARM (CI runs both flavors; the
 # fallbacks otherwise never get built on Apple Silicon dev machines).
-option(VECTORDB_FORCE_SCALAR "Disable NEON paths, build scalar fallbacks" OFF)
-if(VECTORDB_FORCE_SCALAR)
-  target_compile_definitions(vectordb_core PUBLIC VECTORDB_FORCE_SCALAR)
+option(PROXIMA_FORCE_SCALAR "Disable NEON paths, build scalar fallbacks" OFF)
+if(PROXIMA_FORCE_SCALAR)
+  target_compile_definitions(proxima_core PUBLIC PROXIMA_FORCE_SCALAR)
 endif()
 
 # AddressSanitizer smoke test: a standalone C++ harness that drives every
@@ -64,21 +64,21 @@ endif()
 # catches the OOB/use-after-free class on every push (the v5 segfault would
 # have tripped this). In this mode the pybind module is skipped, the job
 # only runs the harness.
-option(VECTORDB_ASAN "Build the ASan smoke-test executable instead of the module" OFF)
-if(VECTORDB_ASAN)
-  target_compile_options(vectordb_core PUBLIC -fsanitize=address -fno-omit-frame-pointer)
-  target_link_options(vectordb_core PUBLIC -fsanitize=address)
+option(PROXIMA_ASAN "Build the ASan smoke-test executable instead of the module" OFF)
+if(PROXIMA_ASAN)
+  target_compile_options(proxima_core PUBLIC -fsanitize=address -fno-omit-frame-pointer)
+  target_link_options(proxima_core PUBLIC -fsanitize=address)
   add_executable(asan_smoke tests/cpp/asan_smoke.cpp)
-  target_link_libraries(asan_smoke PRIVATE vectordb_core)
+  target_link_libraries(asan_smoke PRIVATE proxima_core)
 else()
-  pybind11_add_module(_vectordb src/bindings.cpp)
-  target_link_libraries(_vectordb PRIVATE vectordb_core)
-  target_include_directories(_vectordb PRIVATE include)
-  if(VECTORDB_FORCE_SCALAR)
-    target_compile_definitions(_vectordb PRIVATE VECTORDB_FORCE_SCALAR)
+  pybind11_add_module(_proxima src/bindings.cpp)
+  target_link_libraries(_proxima PRIVATE proxima_core)
+  target_include_directories(_proxima PRIVATE include)
+  if(PROXIMA_FORCE_SCALAR)
+    target_compile_definitions(_proxima PRIVATE PROXIMA_FORCE_SCALAR)
   endif()
   # Drop the compiled module next to the Python package for in-place use.
-  set_target_properties(_vectordb PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/python/vectordb
+  set_target_properties(_proxima PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/python/proxima
   )
 endif()

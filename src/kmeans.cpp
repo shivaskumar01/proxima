@@ -1,13 +1,13 @@
-#include "vectordb/kmeans.hpp"
-#include "vectordb/distance.hpp"
-#include "vectordb/parallel.hpp"
+#include "proxima/kmeans.hpp"
+#include "proxima/distance.hpp"
+#include "proxima/parallel.hpp"
 
 #include <algorithm>
 #include <cstring>
 #include <limits>
 #include <random>
 
-namespace vectordb {
+namespace proxima {
 
 int32_t nearest_centroid(const float* x, const float* centroids,
                          std::size_t k, std::size_t dim) noexcept {
@@ -170,4 +170,4 @@ void kmeans(const float* data, std::size_t n, std::size_t dim,
     if (out_assign) *out_assign = std::move(assign);
 }
 
-}  // namespace vectordb
+}  // namespace proxima

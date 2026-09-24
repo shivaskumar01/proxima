@@ -11,7 +11,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import numpy as np
 import pytest
 
-from vectordb import FlatIndex, HnswIndex, IvfPqIndex, IvfPqFastScan
+from proxima import FlatIndex, HnswIndex, IvfPqIndex, IvfPqFastScan
 
 
 RNG = np.random.default_rng(0)
@@ -686,7 +686,7 @@ def test_ivfpq_adc_distances_sane():
 def _build_duplicate_heavy(q):
     """Child-process worker for test_hnsw_duplicate_heavy_build_terminates."""
     import numpy as np
-    from vectordb import HnswIndex
+    from proxima import HnswIndex
 
     rng = np.random.default_rng(0)
     base = rng.standard_normal((2000, 64), dtype=np.float32)
@@ -980,6 +980,195 @@ def test_hnsw_delete_all_then_readd():
     _, pred = idx.search(q, k=10, ef=64)
     assert (pred[pred >= 0] >= 400).all()             # only re-added labels
     assert recall_at_k(pred, truth + 400, k=10) >= 0.85
+
+
+# ---- updates ---------------------------------------------------------------
+
+INDEX_KINDS = ["flat", "hnsw", "ivfpq", "ivfpqfs"]
+
+
+def unit(x: np.ndarray) -> np.ndarray:
+    return x / np.linalg.norm(x, axis=1, keepdims=True)
+
+
+def build(kind: str, data: np.ndarray, metric: str = "l2", train_on=None):
+    d = data.shape[1]
+    if kind == "flat":
+        idx = FlatIndex(dim=d, metric=metric)
+    elif kind == "hnsw":
+        idx = HnswIndex(dim=d, metric=metric, M=16, ef_construction=200, seed=4)
+    else:
+        cls = IvfPqIndex if kind == "ivfpq" else IvfPqFastScan
+        idx = cls(dim=d, nlist=16, M=8, kmeans_iters=10, seed=5, metric=metric)
+        idx.train(data if train_on is None else train_on)
+    idx.add(data)
+    return idx
+
+
+def search(idx, q: np.ndarray, k: int):
+    if isinstance(idx, FlatIndex):
+        return idx.search(q, k=k)
+    if isinstance(idx, HnswIndex):
+        return idx.search(q, k=k, ef=max(64, k))
+    return idx.search(q, k=k, nprobe=idx.nlist)       # exhaustive
+
+
+@pytest.mark.parametrize("metric", ["l2", "ip"])
+@pytest.mark.parametrize("kind", INDEX_KINDS)
+def test_update_replaces_vector_keeps_label(kind, metric):
+    d, n = 32, 2000
+    data = gen_data(n, d)
+    if metric == "ip":
+        data = unit(data)
+    idx = build(kind, data, metric)
+    a, b = 10, 1500
+
+    idx.update(np.array([a], dtype=np.int64), data[b:b + 1])
+    assert idx.size == n
+
+    # a now holds a copy of b's vector: identical codes / distances, so a
+    # scores exactly like b for b's own query.
+    D, L = search(idx, data[b:b + 1], k=n if kind.startswith("ivf") else 10)
+    got = dict(zip(L[0].tolist(), D[0].tolist()))
+    assert a in got and b in got, kind
+    assert got[a] == got[b], kind
+    if kind in ("flat", "hnsw"):
+        assert set(L[0, :2].tolist()) == {a, b}, kind
+        # a's old vector no longer finds a.
+        _, L_old = search(idx, data[a:a + 1], k=1)
+        assert L_old[0, 0] != a, kind
+
+
+@pytest.mark.parametrize("kind", ["flat", "ivfpq", "ivfpqfs"])
+def test_update_matches_fresh_build(kind):
+    """Updating rows must be indistinguishable from having added the new
+    rows in the first place: same label -> same distance for every label.
+    For IVF this covers both in-place rewrites and cross-list moves."""
+    d, n = 32, 1000
+    data = gen_data(n, d)
+    ids = np.arange(0, n, 3, dtype=np.int64)
+    new = gen_data(len(ids), d)
+    cur = data.copy()
+    cur[ids] = new
+
+    idx = build(kind, data)
+    idx.update(ids, new)
+    # Reference: trained on the same (old) data, so identical codebooks,
+    # with the updated rows added directly; row i is label i in both.
+    ref = build(kind, cur, train_on=data)
+    if kind.startswith("ivf"):
+        assert idx.list_sizes() == ref.list_sizes()
+        assert idx.list_sizes() != build(kind, data).list_sizes()  # moves happened
+
+    q = gen_data(5, d)
+    D1, L1 = search(idx, q, k=n)
+    D2, L2 = search(ref, q, k=n)
+    for i in range(len(q)):
+        assert dict(zip(L1[i].tolist(), D1[i].tolist())) == \
+            dict(zip(L2[i].tolist(), D2[i].tolist())), (kind, i)
+
+
+@pytest.mark.parametrize("metric", ["l2", "ip"])
+def test_hnsw_update_bulk_recall(metric):
+    """Re-linked graph stays as good as a fresh build after rewriting 30%
+    and then 100% of the vectors."""
+    d, n = 32, 2000
+    data = gen_data(n, d)
+    q = gen_data(100, d)
+    if metric == "ip":
+        data, q = unit(data), unit(q)
+    idx = build("hnsw", data, metric)
+    cur = data.copy()
+    order = np.random.default_rng(1).permutation(n).astype(np.int64)
+    for ids in (order[:600], order):
+        new = gen_data(len(ids), d)
+        if metric == "ip":
+            new = unit(new)
+        idx.update(ids, new)
+        cur[ids] = new
+        assert idx.size == n
+
+        flat = FlatIndex(dim=d, metric=metric)
+        flat.add(cur)
+        _, truth = flat.search(q, k=10)
+        _, pred = idx.search(q, k=10, ef=64)
+        r = recall_at_k(pred, truth, k=10)
+        assert r >= 0.95, f"recall after update too low: {r}"
+        _, self_hit = idx.search(new, k=1, ef=64)
+        assert np.mean(self_hit[:, 0] == ids) >= 0.98
+
+
+@pytest.mark.parametrize("kind", INDEX_KINDS)
+def test_update_rejects_bad_batches_atomically(kind):
+    d, n = 16, 600
+    data = gen_data(n, d)
+    idx = build(kind, data)
+    idx.remove_ids(np.array([7], dtype=np.int64))
+    q = gen_data(10, d)
+    D0, L0 = search(idx, q, k=10)
+    v = gen_data(2, d)
+
+    with pytest.raises(KeyError):
+        idx.update(np.array([n + 5], dtype=np.int64), v[:1])    # never existed
+    with pytest.raises(KeyError):
+        idx.update(np.array([7], dtype=np.int64), v[:1])        # removed
+    with pytest.raises(KeyError):
+        idx.update(np.array([3, -1], dtype=np.int64), v)        # one bad id
+    with pytest.raises(ValueError):
+        idx.update(np.array([3, 3], dtype=np.int64), v)         # duplicate
+    with pytest.raises(ValueError):
+        idx.update(np.array([3, 4], dtype=np.int64), v[:1])     # length mismatch
+    with pytest.raises(ValueError):
+        idx.update(np.array([3], dtype=np.int64), gen_data(1, d + 1))
+    with pytest.raises(ValueError):
+        idx.update(np.array([[3]], dtype=np.int64), v[:1])      # ids not 1-D
+
+    # Nothing was applied, including label 3 from the mixed batch.
+    D1, L1 = search(idx, q, k=10)
+    assert np.array_equal(L0, L1) and np.array_equal(D0, D1), kind
+    assert idx.size == n - 1
+    idx.update(np.array([], dtype=np.int64), np.empty((0, d), np.float32))
+
+
+def test_ivfpq_update_before_train_raises():
+    for cls in (IvfPqIndex, IvfPqFastScan):
+        idx = cls(dim=16, nlist=4, M=4)
+        with pytest.raises(RuntimeError):
+            idx.update(np.array([0], dtype=np.int64), gen_data(1, 16))
+
+
+@pytest.mark.parametrize("kind", INDEX_KINDS)
+def test_update_survives_save_load_and_keeps_labels(kind, tmp_path):
+    d, n = 16, 800
+    data = gen_data(n, d)
+    idx = build(kind, data)
+    ids = np.array([0, 5, 399, 799], dtype=np.int64)
+    idx.update(ids, gen_data(len(ids), d))
+
+    p = str(tmp_path / f"{kind}.bin")
+    idx.save(p)
+    loaded = type(idx).load(p)
+    q = gen_data(20, d)
+    D1, L1 = search(idx, q, k=10)
+    D2, L2 = search(loaded, q, k=10)
+    assert np.array_equal(L1, L2) and np.array_equal(D1, D2), kind
+
+    # update mints no labels: the next add continues at n, and an updated
+    # label can still be removed.
+    loaded.add(data[:1])
+    _, L = search(loaded, data[:1], k=3)
+    assert n in L[0].tolist(), kind
+    assert loaded.remove_ids(np.array([5], dtype=np.int64)) == 1
+    assert loaded.size == n
+
+
+def test_hnsw_update_single_node():
+    idx = HnswIndex(dim=4, metric="l2", M=4, seed=0)
+    idx.add(gen_data(1, 4))
+    v = gen_data(1, 4)
+    idx.update(np.array([0], dtype=np.int64), v)
+    D, L = idx.search(v, k=1)
+    assert L[0, 0] == 0 and D[0, 0] == 0.0
 
 
 # ---- multithread safety -------------------------------------------------

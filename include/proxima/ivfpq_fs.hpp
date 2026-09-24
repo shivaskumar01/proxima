@@ -1,13 +1,13 @@
 #pragma once
 
-#include "vectordb/types.hpp"
+#include "proxima/types.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
 
-namespace vectordb {
+namespace proxima {
 
 // IVF-PQ "fast scan": 4-bit product quantization scanned with the NEON
 // `tbl` instruction, the design FAISS ships as IndexIVFPQFastScan.
@@ -50,6 +50,12 @@ public:
     // Surviving labels unchanged; labels never reused. Returns count removed.
     std::size_t remove_ids(const label_t* labels, std::size_t n);
 
+    // Re-encode the vectors of n existing labels, keeping the labels:
+    // rewritten in place if the coarse list is unchanged, moved otherwise.
+    // Throws std::out_of_range for a label not in the index and
+    // std::invalid_argument for a duplicate, before modifying anything.
+    void update(const label_t* labels, const float* data, std::size_t n);
+
     bool        is_trained() const noexcept { return trained_; }
     std::size_t size() const noexcept { return ntotal_; }
     std::size_t dim()  const noexcept { return dim_; }
@@ -73,6 +79,16 @@ private:
 
     void encode_vector(const float* x, int32_t coarse_id,
                        uint8_t* out_code, float* r_sub_scratch) const;
+    void assign_and_encode(const float* data, std::size_t n,
+                           int32_t* coarse, uint8_t* codes) const;
+
+    // Write one M-code vector into lane `pos` of a packed list (the list
+    // must already span pos's block).
+    void pack_code(std::vector<uint8_t>& packed, std::size_t pos,
+                   const uint8_t* code) const;
+    // Append one encoded vector to list c. Does not touch ntotal_.
+    void append(int32_t c, label_t label, const uint8_t* code);
+
     void rebuild_codebooks_T();
     void rebuild_precomputed_table();
 
@@ -103,4 +119,4 @@ private:
     std::vector<std::vector<uint8_t>> inv_packed_;
 };
 
-}  // namespace vectordb
+}  // namespace proxima

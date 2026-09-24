@@ -1,9 +1,10 @@
-#include "vectordb/ivfpq.hpp"
-#include "vectordb/coarse.hpp"
-#include "vectordb/distance.hpp"
-#include "vectordb/io.hpp"
-#include "vectordb/kmeans.hpp"
-#include "vectordb/parallel.hpp"
+#include "proxima/ivfpq.hpp"
+#include "proxima/coarse.hpp"
+#include "proxima/distance.hpp"
+#include "proxima/io.hpp"
+#include "proxima/kmeans.hpp"
+#include "proxima/parallel.hpp"
+#include "proxima/update.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -11,9 +12,9 @@
 #include <stdexcept>
 #include <unordered_set>
 
-#include "vectordb/simd.hpp"
+#include "proxima/simd.hpp"
 
-namespace vectordb {
+namespace proxima {
 
 IvfPqIndex::IvfPqIndex(std::size_t dim, std::size_t nlist, std::size_t M,
                        std::size_t kmeans_iters, uint64_t seed, Metric metric)
@@ -179,16 +180,11 @@ void IvfPqIndex::encode_vector(const float* x, int32_t coarse_id,
     }
 }
 
-void IvfPqIndex::add(const float* data, std::size_t n) {
-    if (!trained_) throw std::logic_error("IVF-PQ: add() before train()");
-    if (n == 0) return;
-
-    // Phase 1 (parallel): coarse-assign + PQ-encode every vector. Dominated
-    // by the nearest_centroid scan over nlist coarse centroids per vector;
-    // each vector is independent and writes to disjoint slots, so the result
-    // is identical to the serial encode.
-    std::vector<int32_t> coarse(n);
-    std::vector<uint8_t> codes(n * M_);
+void IvfPqIndex::assign_and_encode(const float* data, std::size_t n,
+                                   int32_t* coarse, uint8_t* codes) const {
+    // Dominated by the nearest_centroid scan over nlist coarse centroids per
+    // vector; each vector is independent and writes to disjoint slots, so
+    // the result is identical to the serial encode.
     parallel_for<std::vector<float>>(n,
         [dsub = dsub_]() { return std::vector<float>(dsub); },  // residual scratch
         [&](std::size_t i, std::vector<float>& r_sub) {
@@ -196,18 +192,79 @@ void IvfPqIndex::add(const float* data, std::size_t n) {
             coarse[i] = (metric_ == Metric::L2)
                 ? nearest_centroid(x, coarse_centroids_.data(), nlist_, dim_)
                 : nearest_centroid_ip(x, coarse_centroids_.data(), nlist_, dim_);
-            encode_vector(x, coarse[i], codes.data() + i * M_, r_sub.data());
+            encode_vector(x, coarse[i], codes + i * M_, r_sub.data());
         });
+}
+
+void IvfPqIndex::append(int32_t c, label_t label, const uint8_t* code) {
+    inv_labels_[c].push_back(label);
+    inv_codes_[c].insert(inv_codes_[c].end(), code, code + M_);
+}
+
+void IvfPqIndex::add(const float* data, std::size_t n) {
+    if (!trained_) throw std::logic_error("IVF-PQ: add() before train()");
+    if (n == 0) return;
+
+    // Phase 1 (parallel): coarse-assign + PQ-encode every vector.
+    std::vector<int32_t> coarse(n);
+    std::vector<uint8_t> codes(n * M_);
+    assign_and_encode(data, n, coarse.data(), codes.data());
 
     // Phase 2 (serial): append to the inverted lists in input order so labels
     // remain sequential and list contents deterministic.
     for (std::size_t i = 0; i < n; ++i) {
-        inv_labels_[coarse[i]].push_back(next_label_++);
-        auto& dst = inv_codes_[coarse[i]];
-        dst.insert(dst.end(), codes.begin() + i * M_,
-                   codes.begin() + (i + 1) * M_);
+        append(coarse[i], next_label_++, codes.data() + i * M_);
     }
     ntotal_ += n;
+}
+
+void IvfPqIndex::update(const label_t* labels, const float* data, std::size_t n) {
+    if (!trained_) throw std::logic_error("IVF-PQ: update() before train()");
+    if (n == 0) return;
+    const auto want = detail::index_update_batch(labels, n);
+
+    // Locate every label (list, position) before touching anything.
+    std::vector<std::pair<int32_t, std::size_t>> loc(n, {-1, 0});
+    std::size_t found = 0;
+    for (std::size_t c = 0; c < nlist_ && found < n; ++c) {
+        const auto& ls = inv_labels_[c];
+        for (std::size_t r = 0; r < ls.size(); ++r) {
+            auto it = want.find(ls[r]);
+            if (it != want.end()) {
+                loc[it->second] = {static_cast<int32_t>(c), r};
+                ++found;
+            }
+        }
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+        if (loc[i].first < 0) detail::throw_missing_label(labels[i]);
+    }
+
+    std::vector<int32_t> coarse(n);
+    std::vector<uint8_t> codes(n * M_);
+    assign_and_encode(data, n, coarse.data(), codes.data());
+
+    // Same list: overwrite the code in place. Otherwise move it. In-place
+    // writes go first, while the recorded positions are still valid;
+    // remove_ids then compacts the source lists.
+    std::vector<label_t> moved;
+    for (std::size_t i = 0; i < n; ++i) {
+        const uint8_t* code = codes.data() + i * M_;
+        if (coarse[i] == loc[i].first) {
+            std::copy(code, code + M_,
+                      inv_codes_[loc[i].first].begin() + loc[i].second * M_);
+        } else {
+            moved.push_back(labels[i]);
+        }
+    }
+    if (moved.empty()) return;
+    remove_ids(moved.data(), moved.size());
+    for (std::size_t i = 0; i < n; ++i) {
+        if (coarse[i] != loc[i].first) {
+            append(coarse[i], labels[i], codes.data() + i * M_);
+        }
+    }
+    ntotal_ += moved.size();
 }
 
 std::size_t IvfPqIndex::remove_ids(const label_t* labels, std::size_t n) {
@@ -338,7 +395,7 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
             const float* cb_T_m = pq_codebooks_T_.data() + m * dsub_ * KSUB;
             float*       qd_m   = qdot.data() + m * KSUB;
 
-#if VECTORDB_USE_NEON
+#if PROXIMA_USE_NEON
             for (std::size_t k_start = 0; k_start < KSUB; k_start += 16) {
                 float32x4_t a0 = vdupq_n_f32(0.0f);
                 float32x4_t a1 = vdupq_n_f32(0.0f);
@@ -394,7 +451,7 @@ void IvfPqIndex::search(const float* queries, std::size_t nq, std::size_t k,
                 static_cast<std::size_t>(c) * M_ * KSUB;
             const float  bias = coarse_d[c];
             const std::size_t total = M_ * KSUB;
-#if VECTORDB_USE_NEON
+#if PROXIMA_USE_NEON
             for (std::size_t i = 0; i < total; i += 16) {
                 vst1q_f32(lut.data() + i,
                           vaddq_f32(vld1q_f32(pc + i), vld1q_f32(qdot.data() + i)));
@@ -580,4 +637,4 @@ std::vector<std::size_t> IvfPqIndex::list_sizes() const {
     return sizes;
 }
 
-}  // namespace vectordb
+}  // namespace proxima

@@ -1,13 +1,13 @@
 #pragma once
 
-#include "vectordb/types.hpp"
+#include "proxima/types.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
 
-namespace vectordb {
+namespace proxima {
 
 // Brute-force linear scan. Used as the recall ground truth for HNSW/IVF-PQ
 // and as a baseline for the SIMD distance kernels.
@@ -37,6 +37,12 @@ public:
     // of vectors actually removed.
     std::size_t remove_ids(const label_t* labels, std::size_t n);
 
+    // Overwrite the vectors stored under n existing labels (data is n x dim,
+    // row i replaces labels[i]). Labels and row order are unchanged. Throws
+    // std::out_of_range for a label not in the index and
+    // std::invalid_argument for a duplicate, before modifying anything.
+    void update(const label_t* labels, const float* data, std::size_t n);
+
     std::size_t size() const noexcept { return ntotal_; }
     std::size_t dim()  const noexcept { return dim_; }
     Metric      metric() const noexcept { return metric_; }
@@ -59,4 +65,4 @@ private:
     label_t              next_label_ = 0;
 };
 
-}  // namespace vectordb
+}  // namespace proxima

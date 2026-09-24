@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace vectordb {
+namespace proxima {
 
 // In-place Lloyd's algorithm with k-means++ initialization.
 //
@@ -37,4 +37,4 @@ int32_t nearest_centroid(const float* x, const float* centroids,
 int32_t nearest_centroid_ip(const float* x, const float* centroids,
                             std::size_t k, std::size_t dim) noexcept;
 
-}  // namespace vectordb
+}  // namespace proxima

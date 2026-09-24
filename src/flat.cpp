@@ -1,7 +1,8 @@
-#include "vectordb/flat.hpp"
-#include "vectordb/distance.hpp"
-#include "vectordb/io.hpp"
-#include "vectordb/parallel.hpp"
+#include "proxima/flat.hpp"
+#include "proxima/distance.hpp"
+#include "proxima/io.hpp"
+#include "proxima/parallel.hpp"
+#include "proxima/update.hpp"
 
 #include <algorithm>
 #include <queue>
@@ -9,7 +10,7 @@
 #include <unordered_set>
 #include <utility>
 
-namespace vectordb {
+namespace proxima {
 
 FlatIndex::FlatIndex(std::size_t dim, Metric metric)
     : dim_(dim), metric_(metric) {
@@ -40,6 +41,29 @@ std::size_t FlatIndex::remove_ids(const label_t* labels, std::size_t n) {
     data_.resize(w * dim_);
     labels_.resize(w);
     return removed;
+}
+
+void FlatIndex::update(const label_t* labels, const float* data, std::size_t n) {
+    if (n == 0) return;
+    const auto want = detail::index_update_batch(labels, n);
+
+    // Resolve every label to its row first; nothing is written until the
+    // whole batch is known to be valid.
+    constexpr std::size_t kMissing = static_cast<std::size_t>(-1);
+    std::vector<std::size_t> row(n, kMissing);
+    std::size_t found = 0;
+    for (std::size_t r = 0; r < ntotal_ && found < n; ++r) {
+        auto it = want.find(labels_[r]);
+        if (it != want.end()) { row[it->second] = r; ++found; }
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+        if (row[i] == kMissing) detail::throw_missing_label(labels[i]);
+    }
+
+    for (std::size_t i = 0; i < n; ++i) {
+        std::copy(data + i * dim_, data + (i + 1) * dim_,
+                  data_.begin() + row[i] * dim_);
+    }
 }
 
 namespace {
@@ -154,4 +178,4 @@ FlatIndex FlatIndex::load(const std::string& path) {
     return idx;
 }
 
-}  // namespace vectordb
+}  // namespace proxima

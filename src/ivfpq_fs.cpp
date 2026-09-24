@@ -1,9 +1,10 @@
-#include "vectordb/ivfpq_fs.hpp"
-#include "vectordb/coarse.hpp"
-#include "vectordb/distance.hpp"
-#include "vectordb/io.hpp"
-#include "vectordb/kmeans.hpp"
-#include "vectordb/parallel.hpp"
+#include "proxima/ivfpq_fs.hpp"
+#include "proxima/coarse.hpp"
+#include "proxima/distance.hpp"
+#include "proxima/io.hpp"
+#include "proxima/kmeans.hpp"
+#include "proxima/parallel.hpp"
+#include "proxima/update.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -11,9 +12,9 @@
 #include <stdexcept>
 #include <unordered_set>
 
-#include "vectordb/simd.hpp"
+#include "proxima/simd.hpp"
 
-namespace vectordb {
+namespace proxima {
 
 IvfPqFastScan::IvfPqFastScan(std::size_t dim, std::size_t nlist, std::size_t M,
                              std::size_t kmeans_iters, uint64_t seed,
@@ -160,13 +161,8 @@ void IvfPqFastScan::encode_vector(const float* x, int32_t coarse_id,
     }
 }
 
-void IvfPqFastScan::add(const float* data, std::size_t n) {
-    if (!trained_) throw std::logic_error("IVF-PQ-FS: add() before train()");
-    if (n == 0) return;
-
-    // Phase 1 (parallel): coarse-assign + encode into per-vector slots.
-    std::vector<int32_t> coarse(n);
-    std::vector<uint8_t> codes(n * M_);
+void IvfPqFastScan::assign_and_encode(const float* data, std::size_t n,
+                                      int32_t* coarse, uint8_t* codes) const {
     parallel_for<std::vector<float>>(n,
         [dsub = dsub_]() { return std::vector<float>(dsub); },
         [&](std::size_t i, std::vector<float>& r_sub) {
@@ -174,26 +170,92 @@ void IvfPqFastScan::add(const float* data, std::size_t n) {
             coarse[i] = (metric_ == Metric::L2)
                 ? nearest_centroid(x, coarse_centroids_.data(), nlist_, dim_)
                 : nearest_centroid_ip(x, coarse_centroids_.data(), nlist_, dim_);
-            encode_vector(x, coarse[i], codes.data() + i * M_, r_sub.data());
+            encode_vector(x, coarse[i], codes + i * M_, r_sub.data());
         });
+}
+
+void IvfPqFastScan::pack_code(std::vector<uint8_t>& packed, std::size_t pos,
+                              const uint8_t* code) const {
+    const std::size_t base = (pos / BLOCK) * block_bytes();
+    const std::size_t lane = pos % BLOCK;
+    for (std::size_t p = 0; p < M_ / 2; ++p) {
+        packed[base + p * BLOCK + lane] =
+            static_cast<uint8_t>(code[2 * p] | (code[2 * p + 1] << 4));
+    }
+}
+
+void IvfPqFastScan::append(int32_t c, label_t label, const uint8_t* code) {
+    auto& labels = inv_labels_[c];
+    auto& packed = inv_packed_[c];
+    if (labels.size() % BLOCK == 0) {
+        packed.resize(packed.size() + block_bytes(), 0);
+    }
+    pack_code(packed, labels.size(), code);
+    labels.push_back(label);
+}
+
+void IvfPqFastScan::add(const float* data, std::size_t n) {
+    if (!trained_) throw std::logic_error("IVF-PQ-FS: add() before train()");
+    if (n == 0) return;
+
+    // Phase 1 (parallel): coarse-assign + encode into per-vector slots.
+    std::vector<int32_t> coarse(n);
+    std::vector<uint8_t> codes(n * M_);
+    assign_and_encode(data, n, coarse.data(), codes.data());
 
     // Phase 2 (serial): nibble-pack into the block layout in input order.
-    const std::size_t bb = block_bytes();
     for (std::size_t i = 0; i < n; ++i) {
-        const int32_t c = coarse[i];
-        auto& labels = inv_labels_[c];
-        auto& packed = inv_packed_[c];
-        const std::size_t lane = labels.size() % BLOCK;
-        if (lane == 0) packed.resize(packed.size() + bb, 0);
-        const std::size_t base = (labels.size() / BLOCK) * bb;
-        const uint8_t* code = codes.data() + i * M_;
-        for (std::size_t p = 0; p < M_ / 2; ++p) {
-            packed[base + p * BLOCK + lane] =
-                static_cast<uint8_t>(code[2 * p] | (code[2 * p + 1] << 4));
-        }
-        labels.push_back(next_label_++);
+        append(coarse[i], next_label_++, codes.data() + i * M_);
     }
     ntotal_ += n;
+}
+
+void IvfPqFastScan::update(const label_t* labels, const float* data,
+                           std::size_t n) {
+    if (!trained_) throw std::logic_error("IVF-PQ-FS: update() before train()");
+    if (n == 0) return;
+    const auto want = detail::index_update_batch(labels, n);
+
+    // Locate every label (list, lane position) before touching anything.
+    std::vector<std::pair<int32_t, std::size_t>> loc(n, {-1, 0});
+    std::size_t found = 0;
+    for (std::size_t c = 0; c < nlist_ && found < n; ++c) {
+        const auto& ls = inv_labels_[c];
+        for (std::size_t r = 0; r < ls.size(); ++r) {
+            auto it = want.find(ls[r]);
+            if (it != want.end()) {
+                loc[it->second] = {static_cast<int32_t>(c), r};
+                ++found;
+            }
+        }
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+        if (loc[i].first < 0) detail::throw_missing_label(labels[i]);
+    }
+
+    std::vector<int32_t> coarse(n);
+    std::vector<uint8_t> codes(n * M_);
+    assign_and_encode(data, n, coarse.data(), codes.data());
+
+    // Same list: repack the lane in place. Otherwise move it (in-place
+    // writes first, while the recorded positions are still valid).
+    std::vector<label_t> moved;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (coarse[i] == loc[i].first) {
+            pack_code(inv_packed_[loc[i].first], loc[i].second,
+                      codes.data() + i * M_);
+        } else {
+            moved.push_back(labels[i]);
+        }
+    }
+    if (moved.empty()) return;
+    remove_ids(moved.data(), moved.size());
+    for (std::size_t i = 0; i < n; ++i) {
+        if (coarse[i] != loc[i].first) {
+            append(coarse[i], labels[i], codes.data() + i * M_);
+        }
+    }
+    ntotal_ += moved.size();
 }
 
 std::size_t IvfPqFastScan::remove_ids(const label_t* labels, std::size_t n) {
@@ -226,13 +288,7 @@ std::size_t IvfPqFastScan::remove_ids(const label_t* labels, std::size_t n) {
         ls = std::move(keep_l);
         packed.assign(((ls.size() + BLOCK - 1) / BLOCK) * bb, 0);
         for (std::size_t i = 0; i < ls.size(); ++i) {
-            const std::size_t base = (i / BLOCK) * bb;
-            const std::size_t lane = i % BLOCK;
-            const uint8_t* code = keep_c.data() + i * M_;
-            for (std::size_t p = 0; p < M_ / 2; ++p) {
-                packed[base + p * BLOCK + lane] =
-                    static_cast<uint8_t>(code[2 * p] | (code[2 * p + 1] << 4));
-            }
+            pack_code(packed, i, keep_c.data() + i * M_);
         }
     }
     ntotal_ -= removed;
@@ -335,7 +391,7 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
             const float* q_m    = q + m * dsub_;
             const float* cb_T_m = pq_codebooks_T_.data() + m * dsub_ * KSUB;
             float*       qd_m   = ctx.qdot.data() + m * KSUB;
-#if VECTORDB_USE_NEON
+#if PROXIMA_USE_NEON
             float32x4_t a0 = vdupq_n_f32(0.0f);
             float32x4_t a1 = vdupq_n_f32(0.0f);
             float32x4_t a2 = vdupq_n_f32(0.0f);
@@ -434,7 +490,7 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
                 }
                 return dist;
             };
-#if VECTORDB_USE_NEON
+#if PROXIMA_USE_NEON
             // The scalar build scans exactly and never consults thresholds.
             auto qthresh = [&]() -> uint32_t {
                 if (top.size() < k) return 0xFFFFFFFFu;
@@ -450,7 +506,7 @@ void IvfPqFastScan::search(const float* queries, std::size_t nq, std::size_t k,
             for (std::size_t b = 0; b < nblocks; ++b) {
                 const uint8_t* bp = packed_c.data() + b * bb;
                 const std::size_t lanes = std::min(BLOCK, n_c - b * BLOCK);
-#if VECTORDB_USE_NEON
+#if PROXIMA_USE_NEON
                 // 5. The fast scan: per subspace pair, one load + two tbl
                 //    lookups score 16 candidates; u16 lanes accumulate.
                 __builtin_prefetch(bp + bb, 0, 0);   // next block's codes
@@ -653,4 +709,4 @@ std::vector<std::size_t> IvfPqFastScan::list_sizes() const {
     return sizes;
 }
 
-}  // namespace vectordb
+}  // namespace proxima

@@ -12,14 +12,14 @@
 #include <stdexcept>
 #include <string>
 
-namespace vectordb {
+namespace proxima {
 namespace io {
 
 class Writer {
 public:
     explicit Writer(const std::string& path) {
         f_ = std::fopen(path.c_str(), "wb");
-        if (!f_) throw std::runtime_error("vectordb::io: cannot open for writing: " + path);
+        if (!f_) throw std::runtime_error("proxima::io: cannot open for writing: " + path);
     }
     ~Writer() { if (f_) std::fclose(f_); }
     Writer(const Writer&) = delete;
@@ -28,7 +28,7 @@ public:
     void write_raw(const void* p, std::size_t n) {
         if (n == 0) return;
         if (std::fwrite(p, 1, n, f_) != n) {
-            throw std::runtime_error("vectordb::io: write failed");
+            throw std::runtime_error("proxima::io: write failed");
         }
     }
     template <typename T>
@@ -44,7 +44,7 @@ class Reader {
 public:
     explicit Reader(const std::string& path) {
         f_ = std::fopen(path.c_str(), "rb");
-        if (!f_) throw std::runtime_error("vectordb::io: cannot open for reading: " + path);
+        if (!f_) throw std::runtime_error("proxima::io: cannot open for reading: " + path);
     }
     ~Reader() { if (f_) std::fclose(f_); }
     Reader(const Reader&) = delete;
@@ -53,7 +53,7 @@ public:
     void read_raw(void* p, std::size_t n) {
         if (n == 0) return;
         if (std::fread(p, 1, n, f_) != n) {
-            throw std::runtime_error("vectordb::io: read failed (truncated file?)");
+            throw std::runtime_error("proxima::io: read failed (truncated file?)");
         }
     }
     template <typename T>
@@ -63,7 +63,7 @@ public:
         char m[4];
         read_raw(m, 4);
         if (std::memcmp(m, expected, 4) != 0) {
-            throw std::runtime_error("vectordb::io: bad magic header");
+            throw std::runtime_error("proxima::io: bad magic header");
         }
     }
 
@@ -72,4 +72,4 @@ private:
 };
 
 }  // namespace io
-}  // namespace vectordb
+}  // namespace proxima

@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "benchmarks"))
 
-from vectordb import HnswIndex, IvfPqIndex, IvfPqFastScan          # noqa: E402
+from proxima import HnswIndex, IvfPqIndex, IvfPqFastScan          # noqa: E402
 from sift_loader import fvecs_read, fvecs_chunks, fvecs_shape, ivecs_read  # noqa: E402
 import sift_loader                                                  # noqa: E402
 import gist_loader                                                  # noqa: E402

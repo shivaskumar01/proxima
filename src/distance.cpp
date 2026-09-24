@@ -1,11 +1,11 @@
-#include "vectordb/distance.hpp"
+#include "proxima/distance.hpp"
 
-#include "vectordb/simd.hpp"
-#define VECTORDB_HAS_NEON VECTORDB_USE_NEON
+#include "proxima/simd.hpp"
+#define PROXIMA_HAS_NEON PROXIMA_USE_NEON
 
-namespace vectordb {
+namespace proxima {
 
-#if VECTORDB_HAS_NEON
+#if PROXIMA_HAS_NEON
 
 // 4-way unrolled NEON L2sq. Each NEON reg holds 4 floats; we process 16
 // elements per iteration to (a) saturate the 4 FMA pipes on Apple Silicon
@@ -234,7 +234,7 @@ void dot_x4(const float* q,
 
 #endif
 
-#if VECTORDB_HAS_NEON
+#if PROXIMA_HAS_NEON
 
 void l2sq_4x4(const float* q, std::size_t q_stride,
               const float* c, std::size_t c_stride,
@@ -299,4 +299,4 @@ void dot_ny(float* out, const float* q, const float* base,
     for (; i < ny; ++i) out[i] = dot(q, base + i * d, d);
 }
 
-}  // namespace vectordb
+}  // namespace proxima

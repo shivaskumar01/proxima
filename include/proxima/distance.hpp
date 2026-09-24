@@ -2,7 +2,7 @@
 
 #include <cstddef>
 
-namespace vectordb {
+namespace proxima {
 
 // Squared L2 distance: sum_i (a_i - b_i)^2
 // Squared form avoids a sqrt that doesn't change the ordering of nearest
@@ -62,4 +62,4 @@ void l2sq_4x4(const float* q, std::size_t q_stride,
               const float* c, std::size_t c_stride,
               std::size_t d, float* out) noexcept;
 
-}  // namespace vectordb
+}  // namespace proxima

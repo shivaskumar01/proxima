@@ -1,7 +1,8 @@
-#include "vectordb/hnsw.hpp"
-#include "vectordb/distance.hpp"
-#include "vectordb/io.hpp"
-#include "vectordb/parallel.hpp"
+#include "proxima/hnsw.hpp"
+#include "proxima/distance.hpp"
+#include "proxima/io.hpp"
+#include "proxima/parallel.hpp"
+#include "proxima/update.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -12,7 +13,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace vectordb {
+namespace proxima {
 
 namespace {
 // Below this batch size a parallel build doesn't pay: thread spawn plus the
@@ -406,6 +407,82 @@ std::size_t HnswIndex::remove_ids(const label_t* labels, std::size_t n) {
     return removed;
 }
 
+void HnswIndex::update(const label_t* labels, const float* data, std::size_t n) {
+    if (n == 0) return;
+    detail::index_update_batch(labels, n);   // rejects duplicates
+    for (std::size_t i = 0; i < n; ++i) {
+        const label_t l = labels[i];
+        if (l < 0 || static_cast<std::size_t>(l) >= ntotal_ ||
+            deleted_[static_cast<std::size_t>(l)]) {
+            detail::throw_missing_label(l);
+        }
+    }
+    SearchCtx ctx;
+    for (std::size_t i = 0; i < n; ++i) {
+        update_one(static_cast<id_t>(labels[i]), data + i * dim_, ctx);
+    }
+}
+
+void HnswIndex::update_one(id_t id, const float* v, SearchCtx& ctx) {
+    std::copy(v, v + dim_, data_.begin() + static_cast<std::size_t>(id) * dim_);
+    if (ntotal_ == 1) return;   // lone node: no edges to repair
+    const int lv = level_[id];
+
+    // Step 1 (hnswlib updatePoint): every out-neighbor of `id` may now hold
+    // a stale edge to it. Re-select each one's list from the two-hop
+    // neighborhood, which contains its current neighbors plus `id` at its
+    // new position.
+    std::vector<id_t> cand;
+    std::vector<PairF> pool;
+    for (int layer = 0; layer <= lv; ++layer) {
+        const std::vector<id_t> one_hop = links_[id][layer];
+        if (one_hop.empty()) continue;
+        cand.assign(1, id);
+        for (id_t n1 : one_hop) {
+            cand.push_back(n1);
+            const auto& two_hop = links_[n1][layer];
+            cand.insert(cand.end(), two_hop.begin(), two_hop.end());
+        }
+        std::sort(cand.begin(), cand.end());
+        cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+
+        const std::size_t cap = (layer == 0) ? M_max0_ : M_max_;
+        for (id_t n1 : one_hop) {
+            pool.clear();
+            for (id_t c : cand) {
+                if (c != n1) pool.emplace_back(distance(vec(n1), vec(c)), c);
+            }
+            if (pool.size() > ef_construction_) {
+                std::nth_element(pool.begin(), pool.begin() + ef_construction_,
+                                 pool.end());
+                pool.resize(ef_construction_);
+            }
+            auto kept = select_neighbors_heuristic(vec(n1), pool, cap);
+            auto& links = links_[n1][layer];
+            links.clear();
+            for (const PairF& p : kept) links.push_back(p.second);
+        }
+    }
+
+    // Step 2 (repairConnectionsForUpdate): re-link `id` itself the way
+    // insert_one would at its existing level. If `id` is the entry point
+    // its level is max_level_ and the descent is a no-op.
+    id_t curr = greedy_descend<false>(v, entry_point_, max_level_, lv,
+                                      ctx, nullptr);
+    for (int lc = lv; lc >= 0; --lc) {
+        auto W = search_layer<false>(v, curr, ef_construction_, lc, ctx, nullptr);
+        W.erase(std::remove_if(W.begin(), W.end(),
+                               [id](const PairF& p) { return p.second == id; }),
+                W.end());
+        if (W.empty()) continue;   // alone on this layer: keep its links
+        auto neighbors = select_neighbors_heuristic(v, W, M_);
+        links_[id][lc].clear();
+        connect<false>(id, neighbors, lc, nullptr);
+        curr = std::min_element(W.begin(), W.end(),
+            [](const PairF& a, const PairF& b) { return a.first < b.first; })->second;
+    }
+}
+
 void HnswIndex::search(const float* queries, std::size_t nq, std::size_t k,
                        std::size_t ef,
                        float* out_distances, label_t* out_labels) const {
@@ -558,4 +635,4 @@ std::vector<std::size_t> HnswIndex::level_histogram() const {
     return h;
 }
 
-}  // namespace vectordb
+}  // namespace proxima
