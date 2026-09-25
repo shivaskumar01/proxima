@@ -17,11 +17,14 @@ namespace proxima {
 //   - L2: PQ encodes RESIDUALS (x - coarse centroid); ADC uses the
 //     precomputed-table expansion (see precomp_ below).
 //   - InnerProduct: PQ encodes RAW vectors (residual-IP needs norm
-//     bookkeeping for little gain, FAISS also defaults by_residual=false
-//     for IP). score = sum_m <q_m, y_m>, so the ADC table depends only on
+//     bookkeeping for little gain; FAISS's IndexIVFPQFastScan defaults to
+//     by_residual=false for IP, though plain IndexIVFPQ keeps residuals).
+//     score = sum_m <q_m, y_m>, so the ADC table depends only on
 //     the query: built once per query, ZERO per-probe table work. Lists are
-//     assigned and probed by max <x, centroid>. Cosine = normalize your
-//     vectors and queries, then use "ip".
+//     assigned and probed by max <x, centroid>.
+//   - Cosine: normalize vectors and queries, then use L2, which ranks
+//     identically on unit vectors and keeps residual encoding. On
+//     normalized SIFT1M that is recall@10 0.546 vs 0.213 for "ip".
 //
 // Constraints:
 //   - dim must be divisible by M (so each subspace has dsub = dim / M dims)

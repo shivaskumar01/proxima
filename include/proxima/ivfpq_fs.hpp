@@ -29,7 +29,8 @@ namespace proxima {
 // Shares the precomputed-table ADC expansion with IvfPqIndex for L2; for
 // InnerProduct (raw-vector encoding, FAISS-style) the dot table is
 // probe-independent, so the LUT is built AND quantized once per query.
-// dim % M == 0; M even. Cosine = normalize vectors + queries, use "ip".
+// dim % M == 0; M even. Cosine = normalize vectors + queries, then use L2
+// (same ranking on unit vectors, keeps residual encoding; see ivfpq.hpp).
 class IvfPqFastScan {
 public:
     IvfPqFastScan(std::size_t dim,
